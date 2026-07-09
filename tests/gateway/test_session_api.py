@@ -1,6 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -224,7 +224,12 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat",
-                json={"message": "next", "system_message": "stay focused"},
+                json={
+                    "message": "next",
+                    "system_message": "stay focused",
+                    "model": "gpt-5.5",
+                    "provider": "openai-codex",
+                },
                 headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "client-42"},
             )
             assert resp.status == 200
@@ -241,6 +246,8 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     assert kwargs["session_id"] == session_id
     assert kwargs["gateway_session_key"] == "client-42"
     assert kwargs["ephemeral_system_prompt"] == "stay focused"
+    assert kwargs["model_override"] == "gpt-5.5"
+    assert kwargs["provider_override"] == "openai-codex"
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert isinstance(history[0].pop("timestamp"), (int, float))
@@ -338,6 +345,73 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_disconnect_interrupts_agent(adapter, session_db):
+    """Client disconnects from session SSE should stop the active agent run."""
+    session_id = session_db.create_session("disconnect-session", "api_server")
+    fake_agent = MagicMock()
+    write_count = {"n": 0}
+
+    class DisconnectingStreamResponse:
+        def __init__(self, *args, **kwargs):
+            self.headers = kwargs.get("headers", {})
+
+        async def prepare(self, request):
+            return None
+
+        async def write(self, payload):
+            write_count["n"] += 1
+            if write_count["n"] >= 3:
+                raise ConnectionResetError("simulated disconnect")
+
+    async def fake_run(**kwargs):
+        kwargs["agent_ref"][0] = fake_agent
+        kwargs["stream_delta_callback"]("partial response")
+        await asyncio.sleep(60)
+        return {"final_response": "should not complete", "session_id": session_id}, {"total_tokens": 1}
+
+    request = MagicMock()
+    request.headers = {}
+    request.match_info = {"session_id": session_id}
+    request.json = AsyncMock(return_value={"message": "start then disconnect"})
+
+    import gateway.platforms.api_server as api_mod
+
+    with patch.object(api_mod.web, "StreamResponse", DisconnectingStreamResponse):
+        with patch.object(adapter, "_run_agent", side_effect=fake_run):
+            await adapter._handle_session_chat_stream(request)
+
+    fake_agent.interrupt.assert_called_once_with("SSE client disconnected")
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_rejects_non_string_model(adapter, session_db):
+    session_id = session_db.create_session("bad-model-session", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat/stream",
+            json={"message": "hello", "model": {"bad": "shape"}},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"]["code"] == "invalid_model"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_non_string_provider(adapter, session_db):
+    session_id = session_db.create_session("bad-provider-session", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={"message": "hello", "provider": ["bad"]},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"]["code"] == "invalid_provider"
 
 
 @pytest.mark.asyncio

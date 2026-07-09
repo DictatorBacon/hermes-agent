@@ -80,6 +80,51 @@ class TestRedactApiErrorText:
 
 
 # ---------------------------------------------------------------------------
+# APIServerAdapter._agent_usage_payload
+# ---------------------------------------------------------------------------
+
+
+class TestAgentUsagePayload:
+    def test_includes_current_context_window_usage(self):
+        agent = MagicMock()
+        agent.session_prompt_tokens = 12345
+        agent.session_completion_tokens = 678
+        agent.session_total_tokens = 13023
+        agent.session_api_calls = 2
+        agent.context_compressor.last_prompt_tokens = 4567
+        agent.context_compressor.context_length = 200000
+        agent.context_compressor.compression_count = 1
+
+        usage = APIServerAdapter._agent_usage_payload(agent)
+
+        assert usage == {
+            "input_tokens": 12345,
+            "output_tokens": 678,
+            "total_tokens": 13023,
+            "api_calls": 2,
+            "context_tokens": 4567,
+            "context_length": 200000,
+            "compressions": 1,
+            "context_percent": 2,
+        }
+
+    def test_clamps_transitional_negative_context_sentinel(self):
+        agent = MagicMock()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        agent.session_api_calls = 0
+        agent.context_compressor.last_prompt_tokens = -1
+        agent.context_compressor.context_length = 200000
+        agent.context_compressor.compression_count = 1
+
+        usage = APIServerAdapter._agent_usage_payload(agent)
+
+        assert usage["context_tokens"] == 0
+        assert usage["context_percent"] == 0
+
+
+# ---------------------------------------------------------------------------
 # ResponseStore
 # ---------------------------------------------------------------------------
 

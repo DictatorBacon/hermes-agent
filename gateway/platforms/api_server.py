@@ -1078,6 +1078,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        model_override: Optional[str] = None,
+        provider_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1119,6 +1121,31 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             model = runtime_model
+
+        requested_model = str(model_override).strip() if model_override else ""
+        requested_provider = str(provider_override).strip() if provider_override else ""
+        if requested_provider:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            override_runtime = resolve_runtime_provider(
+                requested=requested_provider,
+                target_model=requested_model or None,
+            )
+            for key in (
+                "api_key",
+                "base_url",
+                "provider",
+                "api_mode",
+                "command",
+                "credential_pool",
+            ):
+                if key in override_runtime:
+                    runtime_kwargs[key] = override_runtime.get(key)
+            if "args" in override_runtime:
+                runtime_kwargs["args"] = list(override_runtime.get("args") or [])
+            model = requested_model or override_runtime.get("model") or model
+        elif requested_model:
+            model = requested_model
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1666,6 +1693,12 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        model_override = body.get("model")
+        if model_override is not None and not isinstance(model_override, str):
+            return web.json_response(_openai_error("model must be a string", code="invalid_model"), status=400)
+        provider_override = body.get("provider") or body.get("model_provider")
+        if provider_override is not None and not isinstance(provider_override, str):
+            return web.json_response(_openai_error("provider must be a string", code="invalid_provider"), status=400)
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -1673,6 +1706,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            model_override=model_override,
+            provider_override=provider_override,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -1710,6 +1745,12 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        model_override = body.get("model")
+        if model_override is not None and not isinstance(model_override, str):
+            return web.json_response(_openai_error("model must be a string", code="invalid_model"), status=400)
+        provider_override = body.get("provider") or body.get("model_provider")
+        if provider_override is not None and not isinstance(provider_override, str):
+            return web.json_response(_openai_error("provider must be a string", code="invalid_provider"), status=400)
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -1751,6 +1792,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        agent_ref: list = [None]
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -1764,6 +1807,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    agent_ref=agent_ref,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1783,12 +1829,39 @@ class APIServerAdapter(BasePlatformAdapter):
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+            except asyncio.CancelledError:
+                # Disconnect/cancel path — do not surface as a stream error event.
+                raise
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                try:
+                    await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                except Exception:
+                    pass
             finally:
-                await queue.put(_event_payload("done", {}))
-                await queue.put(None)
+                try:
+                    await queue.put(_event_payload("done", {}))
+                except Exception:
+                    pass
+                try:
+                    await queue.put(None)
+                except Exception:
+                    pass
+
+        async def _interrupt_stream_task(reason: str) -> None:
+            """Stop the agent run cleanly when the SSE client goes away."""
+            agent = agent_ref[0]
+            if agent is not None:
+                try:
+                    agent.interrupt(reason)
+                except Exception:
+                    pass
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         task = asyncio.create_task(_run_and_signal())
         try:
@@ -1823,10 +1896,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
-        except (asyncio.CancelledError, ConnectionResetError):
-            task.cancel()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as exc:
+            # Client closed the SSE stream mid-run. Interrupt the agent so it
+            # stops LLM/tool work instead of writing to a dead transport.
+            await _interrupt_stream_task("SSE client disconnected")
+            logger.info(
+                "[api_server] session SSE client disconnected for %s (%s); agent interrupted",
+                session_id,
+                type(exc).__name__,
+            )
+        except asyncio.CancelledError:
+            await _interrupt_stream_task("SSE task cancelled")
+            logger.info("[api_server] session SSE task cancelled for %s", session_id)
             raise
         except Exception as exc:
+            await _interrupt_stream_task(f"SSE stream error: {type(exc).__name__}")
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
@@ -3778,6 +3862,35 @@ class APIServerAdapter(BasePlatformAdapter):
             async_delivery=False,
         )
 
+    @staticmethod
+    def _agent_usage_payload(agent) -> Dict[str, Any]:
+        """Return token usage plus current context-window pressure for API clients."""
+        def _nonnegative_int(value: Any, default: int = 0) -> int:
+            if isinstance(value, bool):
+                return int(value)
+            if not isinstance(value, (int, float)):
+                return default
+            return max(0, int(value))
+
+        usage: Dict[str, Any] = {
+            "input_tokens": _nonnegative_int(getattr(agent, "session_prompt_tokens", 0)),
+            "output_tokens": _nonnegative_int(getattr(agent, "session_completion_tokens", 0)),
+            "total_tokens": _nonnegative_int(getattr(agent, "session_total_tokens", 0)),
+        }
+        api_calls = _nonnegative_int(getattr(agent, "session_api_calls", 0), default=0)
+        if api_calls:
+            usage["api_calls"] = api_calls
+
+        compressor = getattr(agent, "context_compressor", None)
+        context_length = _nonnegative_int(getattr(compressor, "context_length", 0)) if compressor else 0
+        if context_length:
+            context_tokens = _nonnegative_int(getattr(compressor, "last_prompt_tokens", 0))
+            usage["context_tokens"] = context_tokens
+            usage["context_length"] = context_length
+            usage["compressions"] = _nonnegative_int(getattr(compressor, "compression_count", 0))
+            usage["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+        return usage
+
     async def _run_agent(
         self,
         user_message: str,
@@ -3790,6 +3903,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        model_override: Optional[str] = None,
+        provider_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3821,6 +3936,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    model_override=model_override,
+                    provider_override=provider_override,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
@@ -3830,11 +3947,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history=conversation_history,
                     task_id=effective_task_id,
                 )
-                usage = {
-                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                }
+                usage = self._agent_usage_payload(agent)
                 # Include the effective session ID in the result so callers
                 # (e.g. X-Hermes-Session-Id header) can track compression-
                 # triggered session rotations. (#16938)
@@ -4114,12 +4227,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                     clear_session_vars(session_tokens)
                                 except Exception:
                                     pass
-                    u = {
-                        "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                        "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                    }
-                    return r, u
+                    return r, self._agent_usage_payload(agent)
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 # Check for structured failure (non-retryable client errors like
