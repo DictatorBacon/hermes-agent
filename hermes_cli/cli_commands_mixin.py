@@ -932,20 +932,19 @@ class CLICommandsMixin:
             _cprint(f"  Failed to create branch session: {e}")
             return
 
-        # Copy conversation history to the new session
-        for msg in self.conversation_history:
-            try:
-                self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    reasoning=msg.get("reasoning"),
-                )
-            except Exception:
-                pass  # Best-effort copy
+        # Copy the complete normalized conversation in one operation. This
+        # preserves tool/reasoning metadata and the context-snapshot marker.
+        try:
+            branch_seed = [
+                {**msg, "_context_snapshot": True}
+                if isinstance(msg, dict)
+                else msg
+                for msg in self.conversation_history
+            ]
+            self._session_db.replace_messages(new_session_id, branch_seed)
+        except Exception as e:
+            _cprint(f"  Failed to copy branch transcript: {e}")
+            return
 
         # Set title on the branch
         try:

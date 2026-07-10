@@ -1635,8 +1635,13 @@ def _persist_branch_seed(session: dict) -> None:
         if db is None:
             return
         try:
-            for msg in seed:
-                db.append_message(session_id=key, role=msg.get("role", "user"), content=msg.get("content"))
+            branch_seed = [
+                {**msg, "_context_snapshot": True}
+                if isinstance(msg, dict)
+                else msg
+                for msg in seed
+            ]
+            db.replace_messages(key, branch_seed)
             session["_branch_seed_persisted"] = True
         except Exception:
             logger.debug("branch seed persist failed", exc_info=True)
@@ -7781,12 +7786,13 @@ def _(rid, params: dict) -> dict:
             parent_session_id=old_key,
             cwd=_session_cwd(session),
         )
-        for msg in history:
-            db.append_message(
-                session_id=new_key,
-                role=msg.get("role", "user"),
-                content=msg.get("content"),
-            )
+        branch_seed = [
+            {**msg, "_context_snapshot": True}
+            if isinstance(msg, dict)
+            else msg
+            for msg in history
+        ]
+        db.replace_messages(new_key, branch_seed)
         db.set_session_title(new_key, title)
     except Exception as e:
         if lease is not None:
@@ -8161,7 +8167,11 @@ def _(rid, params: dict) -> dict:
             session["history_version"] = int(session.get("history_version", 0)) + 1
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    db.replace_messages(
+                        session["session_key"],
+                        truncated,
+                        active_only=db.has_archived_messages(session["session_key"]),
+                    )
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True

@@ -391,6 +391,26 @@ def conversation_history_after_compression(agent: Any, messages: list) -> Option
     return None
 
 
+def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) -> None:
+    """Preserve a real user turn when compacted context contains none."""
+    if any(isinstance(msg, dict) and msg.get("role") == "user" for msg in compressed):
+        return
+    from agent.context_compressor import _fresh_compaction_message_copy
+
+    for msg in reversed(original_messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            compressed.append(_fresh_compaction_message_copy(msg))
+            return
+    compressed.append({
+        "role": "user",
+        "content": (
+            "Continue from the compressed conversation context above. "
+            "This marker exists because the compacted transcript contained "
+            "no preserved user turn."
+        ),
+    })
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -617,6 +637,17 @@ def compress_context(
         finally:
             _release_lock()
 
+    if compressed is messages:
+        # A compressor can decline without setting _last_compress_aborted when
+        # there is no safe middle window. Treat identity-preserving output as a
+        # strict no-op: do not mark real turns as replay snapshots, archive the
+        # transcript, rotate the session, or rebuild the prompt.
+        _release_lock()
+        existing_sp = getattr(agent, "_cached_system_prompt", None)
+        if not existing_sp:
+            existing_sp = agent._build_system_prompt(system_message)
+        return messages, existing_sp
+
     try:
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -648,43 +679,51 @@ def compress_context(
         if todo_snapshot:
             compressed.append({"role": "user", "content": todo_snapshot})
         _ensure_compressed_has_user_turn(messages, compressed)
-        # Everything assembled for the post-compaction model context is a
-        # replay snapshot. Mark after TODO/user continuity additions so none of
-        # that synthetic state is mistaken for a durable chat turn.
-        for message in compressed:
-            message["_context_snapshot"] = True
+        # Snapshot metadata belongs only to the copied post-compaction model
+        # context. Never stamp the original message dictionaries: some protected
+        # head/tail entries are shared by identity with ``messages`` and still
+        # need to be flushed as genuine durable transcript rows.
+        compressed = [
+            {**message, "_context_snapshot": True}
+            if isinstance(message, dict)
+            else message
+            for message in compressed
+        ]
 
-        agent._invalidate_system_prompt()
-        new_system_prompt = agent._build_system_prompt(system_message)
-        agent._cached_system_prompt = new_system_prompt
+        existing_system_prompt = getattr(agent, "_cached_system_prompt", None)
+        if not existing_system_prompt:
+            existing_system_prompt = agent._build_system_prompt(system_message)
+        try:
+            # Build the post-boundary prompt before mutating durable state. Keep
+            # the currently active cache in place until the boundary commits.
+            new_system_prompt = agent._build_system_prompt(system_message)
+            agent._cached_system_prompt = existing_system_prompt
+        except Exception as exc:
+            agent._cached_system_prompt = existing_system_prompt
+            logger.warning("Compression cancelled because prompt rebuild failed: %s", exc)
+            return messages, existing_system_prompt
 
         if agent._session_db:
             try:
-                # Trigger memory extraction on the current session before the
-                # transcript is rewritten (runs in BOTH modes — the logical
-                # conversation's pre-compaction turns are about to be summarized
-                # away regardless of whether the id rotates).
-                agent.commit_memory_session(messages)
-
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
                     # No end_session, no new row, no parent_session_id, no title
                     # renumber, no contextvar/env/logging re-sync. The session's
                     # id, title, cwd, /goal, and gateway routing all stay put.
                     #
-                    # Durable, NON-DESTRUCTIVE replace: soft-archive the
-                    # pre-compaction turns (active=0, kept on disk + FTS-searchable +
-                    # recoverable) and insert `compressed` as the new live (active=1)
-                    # set, atomically. `compressed` already carries the surviving
-                    # tail (current-turn messages the compressor kept via
-                    # protect_last_n), so we DON'T pre-flush here — a flush would
-                    # INSERT current-turn rows that archive_and_compact would then
-                    # archive alongside the rest (harmless but wasted writes). The
-                    # live-context load filters active=1, so a resume reloads ONLY
-                    # the compacted set; the original turns remain under the SAME id
-                    # for search/recovery (Teknium review — keep one durable id
-                    # WITHOUT destroying history, unlike a hard replace_messages).
-                    # See #38763.
+                    # Durable, NON-DESTRUCTIVE replace: first flush every pending
+                    # current-turn row, then soft-archive the complete visible
+                    # transcript and insert `compressed` as the new live model
+                    # context. The replay rows are context snapshots and hidden
+                    # from display, so the flush is what keeps a just-produced tool
+                    # result visible after archival.
+                    flush_ok = agent._flush_messages_to_session_db(messages)
+                    if flush_ok is False:
+                        agent._emit_warning(
+                            "⚠ Compression cancelled because the current turn could not be "
+                            "saved durably. No transcript rows were archived."
+                        )
+                        return messages, existing_system_prompt
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -701,10 +740,13 @@ def compress_context(
                     # Flush any un-persisted current-turn messages to the OLD
                     # session before ending it, so they survive in the preserved
                     # parent transcript (#47202). (In-place skips this — see above.)
-                    try:
-                        agent._flush_messages_to_session_db(messages)
-                    except Exception:
-                        pass  # best-effort — don't block compression on a flush error
+                    flush_ok = agent._flush_messages_to_session_db(messages)
+                    if flush_ok is False:
+                        agent._emit_warning(
+                            "⚠ Compression cancelled because the current turn could not be "
+                            "saved durably. The session was not rotated."
+                        )
+                        return messages, existing_system_prompt
                     # Propagate title to the new session with auto-numbering
                     old_title = agent._session_db.get_session_title(agent.session_id)
                     agent._session_db.end_session(agent.session_id, "compression")
@@ -798,11 +840,8 @@ def compress_context(
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
-                # Shared post-write steps (both modes target agent.session_id, which
-                # in-place keeps and rotation has already reassigned to the new id):
-                # refresh the stored system prompt and reset the flush cursor so the
-                # next turn re-bases its append diff.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                # The durable boundary is committed. Prompt persistence and
+                # memory extraction happen below as non-destructive follow-ups.
                 agent._last_flushed_db_idx = 0
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance
@@ -817,6 +856,33 @@ def compress_context(
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+                return messages, existing_system_prompt
+
+        # The boundary is now committed (or this is an in-memory-only run).
+        # Follow-up failures must not pretend the already-compacted transcript
+        # rolled back. They are logged and the compressed result remains active.
+        try:
+            agent.commit_memory_session(messages)
+        except Exception as exc:
+            logger.warning("Post-compression memory commit failed: %s", exc)
+
+        # Memory providers may update their system-prompt block while committing
+        # the boundary. Rebuild once more so the continuation cache and persisted
+        # prompt observe that freshly committed state. The pre-boundary build above
+        # remains the safe fallback if this best-effort refresh fails.
+        try:
+            new_system_prompt = agent._build_system_prompt(system_message)
+        except Exception as exc:
+            logger.warning("Post-compression prompt refresh failed: %s", exc)
+
+        agent._cached_system_prompt = new_system_prompt
+        if agent._session_db:
+            try:
+                agent._session_db.update_system_prompt(
+                    agent.session_id, new_system_prompt
+                )
+            except Exception as exc:
+                logger.warning("Post-compression prompt persistence failed: %s", exc)
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`

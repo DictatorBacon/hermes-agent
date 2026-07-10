@@ -2243,6 +2243,58 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_persist_branch_seed_preserves_complete_message_metadata(monkeypatch):
+    history = [
+        {"role": "user", "content": "search", "timestamp": 123.0},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+            "reasoning": "thinking",
+            "reasoning_content": "scratchpad",
+            "reasoning_details": [{"type": "summary", "text": "step"}],
+            "codex_reasoning_items": [{"id": "r1"}],
+            "codex_message_items": [{"id": "m1"}],
+            "_context_snapshot": True,
+            "timestamp": 124.0,
+        },
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "_context_snapshot": True,
+            "timestamp": 125.0,
+        },
+    ]
+
+    class _FakeDB:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    db = _FakeDB()
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    session = {
+        "session_key": "branch-child",
+        "parent_session_id": "branch-parent",
+        "history": history,
+        "history_lock": threading.Lock(),
+    }
+
+    server._persist_branch_seed(session)
+
+    assert db.replaced == [
+        (
+            "branch-child",
+            [{**message, "_context_snapshot": True} for message in history],
+        )
+    ]
+    assert session["_branch_seed_persisted"] is True
+
+
 def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
     class _FakeDB:
         def __init__(self):
@@ -4849,8 +4901,12 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
-            self.replaced.append((session_id, list(messages)))
+        def has_archived_messages(self, session_id):
+            assert session_id == "session-key"
+            return True
+
+        def replace_messages(self, session_id, messages, active_only=False):
+            self.replaced.append((session_id, list(messages), active_only))
 
     stub_db = _StubDb()
 
@@ -4882,7 +4938,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        assert stub_db.replaced == [("session-key", original_history[:2])]
+        assert stub_db.replaced == [("session-key", original_history[:2], True)]
     finally:
         server._sessions.pop("sid", None)
 

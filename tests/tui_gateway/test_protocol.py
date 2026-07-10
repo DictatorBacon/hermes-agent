@@ -1120,6 +1120,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     thing that keeps a TUI branch visible.
     """
     create_calls = []
+    replace_calls = []
 
     class _DB:
         def get_session_title(self, _key):
@@ -1132,8 +1133,8 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             create_calls.append((new_key, kwargs))
             return new_key
 
-        def append_message(self, **_kwargs):
-            return None
+        def replace_messages(self, session_id, messages):
+            replace_calls.append((session_id, list(messages)))
 
         def set_session_title(self, _key, _title):
             return None
@@ -1155,9 +1156,30 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
 
     parent_sid = "parent01"
     parent_key = "20260101_000000_parent"
+    history = [
+        {"role": "user", "content": "hello", "timestamp": 123.0},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+            "reasoning_details": [{"type": "summary", "text": "step"}],
+            "codex_reasoning_items": [{"id": "r1"}],
+            "codex_message_items": [{"id": "m1"}],
+            "_context_snapshot": True,
+            "timestamp": 124.0,
+        },
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "_context_snapshot": True,
+            "timestamp": 125.0,
+        },
+    ]
     server._sessions[parent_sid] = {
         "session_key": parent_key,
-        "history": [{"role": "user", "content": "hello"}],
+        "history": history,
         "history_lock": threading.Lock(),
         "cols": 80,
     }
@@ -1173,6 +1195,12 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     assert kwargs["parent_session_id"] == parent_key
     # The marker — without it the branch is invisible in /resume and /sessions.
     assert kwargs["model_config"] == {"_branched_from": parent_key}
+    assert replace_calls == [
+        (
+            "20260101_000001_child0",
+            [{**message, "_context_snapshot": True} for message in history],
+        )
+    ]
 
 
 def test_make_agent_accepts_list_system_prompt(server, monkeypatch):
