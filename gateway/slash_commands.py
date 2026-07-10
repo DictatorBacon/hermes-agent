@@ -3239,7 +3239,15 @@ class GatewaySlashCommandsMixin:
                 # Re-append the verbatim tail after the compressed head,
                 # guarding the seam against illegal role adjacency.
                 if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
+                    tail_snapshot = [
+                        {**message, "_context_snapshot": True}
+                        if isinstance(message, dict)
+                        else message
+                        for message in tail
+                    ]
+                    compressed = rejoin_compressed_head_and_tail(
+                        compressed, tail_snapshot
+                    )
 
                 # _compress_context either rotated (legacy: ended the old
                 # session, created a continuation id — write compressed messages
@@ -3814,25 +3822,20 @@ class GatewaySlashCommandsMixin:
             logger.error("Failed to create branch session: %s", e)
             return t("gateway.branch.create_failed", error=e)
 
-        # Copy conversation history to the new session
-        for msg in history:
-            try:
-                await self._session_db.append_message(
-                    session_id=new_session_id,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    tool_name=msg.get("tool_name") or msg.get("name"),
-                    tool_calls=msg.get("tool_calls"),
-                    tool_call_id=msg.get("tool_call_id"),
-                    finish_reason=msg.get("finish_reason"),
-                    reasoning=msg.get("reasoning"),
-                    reasoning_content=msg.get("reasoning_content"),
-                    reasoning_details=msg.get("reasoning_details"),
-                    codex_reasoning_items=msg.get("codex_reasoning_items"),
-                    codex_message_items=msg.get("codex_message_items"),
-                )
-            except Exception:
-                pass  # Best-effort copy
+        # Copy the complete normalized transcript in one operation. The async
+        # wrapper offloads this SQLite transaction and preserves snapshot,
+        # tool-call, reasoning, Codex, and timestamp metadata.
+        try:
+            branch_seed = [
+                {**msg, "_context_snapshot": True}
+                if isinstance(msg, dict)
+                else msg
+                for msg in history
+            ]
+            await self._session_db.replace_messages(new_session_id, branch_seed)
+        except Exception as e:
+            logger.error("Failed to copy branch transcript: %s", e)
+            return t("gateway.branch.create_failed", error=e)
 
         # Set title
         try:

@@ -891,6 +891,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # A session transcript is an ordered log. Serialize agent turns that target
+        # the same resolved tip so concurrent browser tabs cannot interleave rows or
+        # contaminate each other's completion transcript.
+        self._session_chat_locks: Dict[str, asyncio.Lock] = {}
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1690,6 +1694,29 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
 
+    def _session_chat_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._session_chat_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_chat_locks[session_id] = lock
+        return lock
+
+    @staticmethod
+    async def _await_uncancellable(awaitable):
+        """Delay caller cancellation until a session-mutating worker has stopped."""
+        worker = asyncio.create_task(awaitable)
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await worker
+            except Exception:
+                logger.debug(
+                    "[api_server] session worker failed after client cancellation",
+                    exc_info=True,
+                )
+            raise
+
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
@@ -1818,8 +1845,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = self._ensure_session_db()
-        resolved_id = db.resolve_resume_session_id(session_id)
-        messages = db.get_messages(resolved_id)
+        resolved_id = db.get_compression_tip(session_id) or session_id
+        messages = db.get_messages_for_display(resolved_id, include_ancestors=True)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
@@ -1839,6 +1866,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = self._ensure_session_db()
+        source_id = db.get_compression_tip(source_id) or source_id
+        source = db.get_session(source_id) or source
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
@@ -1854,10 +1883,16 @@ class APIServerAdapter(BasePlatformAdapter):
             fork_id,
             "api_server",
             model=source.get("model"),
+            model_config={"_branched_from": source_id},
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
         )
-        messages = db.get_messages(source_id)
+        messages = [
+            {**message, "_context_snapshot": True}
+            if isinstance(message, dict)
+            else message
+            for message in db.get_messages_as_conversation(source_id)
+        ]
         db.replace_messages(fork_id, messages)
         title = body.get("title")
         if title is None:
@@ -1885,8 +1920,10 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        db = self._ensure_session_db()
+        session_id = db.get_compression_tip(session_id) or session_id
         body, err = await self._read_json_body(request)
-        if err:
+        if err is not None:
             return err
         user_message, err = _session_chat_user_message(body)
         if err is not None:
@@ -1894,14 +1931,19 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
+        lineage_lock_id = db.get_compression_lineage_root(session_id)
+        async with self._session_chat_lock(lineage_lock_id):
+            session_id = db.get_compression_tip(session_id) or session_id
+            history = self._conversation_history_for_session(session_id)
+            result, usage = await self._await_uncancellable(
+                self._run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -1929,6 +1971,8 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        db = self._ensure_session_db()
+        session_id = db.get_compression_tip(session_id) or session_id
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -1979,23 +2023,66 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        lineage_lock_id = db.get_compression_lineage_root(session_id)
+        session_lock = self._session_chat_lock(lineage_lock_id)
+
         async def _run_and_signal() -> None:
+            nonlocal session_id
+            acquired = False
             try:
+                await session_lock.acquire()
+                acquired = True
+                session_id = db.get_compression_tip(session_id) or session_id
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    user_message=user_message,
-                    conversation_history=history,
-                    ephemeral_system_prompt=system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress,
-                    gateway_session_key=gateway_session_key,
+                display_before = None
+                try:
+                    display_before = self._session_db.get_messages_for_display(
+                        session_id, include_ancestors=True
+                    )
+                except Exception:
+                    logger.debug(
+                        "[api_server] failed to capture pre-run display transcript",
+                        exc_info=True,
+                    )
+                result, usage = await self._await_uncancellable(
+                    self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=session_id,
+                        stream_delta_callback=_delta,
+                        tool_progress_callback=_tool_progress,
+                        gateway_session_key=gateway_session_key,
+                    )
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                turn_messages = None
+                if display_before is not None:
+                    try:
+                        display_after = self._session_db.get_messages_for_display(
+                            effective_session_id, include_ancestors=True
+                        )
+                        turn_messages = self._turn_transcript_from_display(
+                            display_before, display_after
+                        )
+                        if (
+                            turn_messages == []
+                            and isinstance(result, dict)
+                            and result.get("messages")
+                        ):
+                            turn_messages = None
+                    except Exception:
+                        logger.debug(
+                            "[api_server] failed to reconcile post-run display transcript",
+                            exc_info=True,
+                        )
+                if turn_messages is None:
+                    turn_messages = self._turn_transcript_messages(
+                        history, user_message, result
+                    ) if isinstance(result, dict) else []
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
@@ -2015,6 +2102,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if acquired:
+                    session_lock.release()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
@@ -3868,6 +3957,39 @@ class APIServerAdapter(BasePlatformAdapter):
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
         return 0
+
+    @classmethod
+    def _turn_transcript_from_display(
+        cls,
+        before: List[Dict[str, Any]],
+        after: List[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return newly appended assistant/tool rows from durable display state.
+
+        ``None`` means the append-only prefix invariant did not hold and the
+        caller should use the legacy in-memory fallback. An empty list is a
+        valid result for a turn that persisted no assistant/tool rows.
+        """
+        if not isinstance(before, list) or not isinstance(after, list):
+            return None
+        before_visible = [
+            cls._message_response(msg) for msg in before if isinstance(msg, dict)
+        ]
+        after_visible = [
+            cls._message_response(msg) for msg in after if isinstance(msg, dict)
+        ]
+        if (
+            len(after_visible) < len(before_visible)
+            or after_visible[:len(before_visible)] != before_visible
+        ):
+            return None
+
+        out: List[Dict[str, Any]] = []
+        for msg in after_visible[len(before_visible):]:
+            if msg.get("role") not in {"assistant", "tool"}:
+                continue
+            out.append(msg)
+        return out
 
     @classmethod
     def _turn_transcript_messages(

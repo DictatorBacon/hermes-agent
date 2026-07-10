@@ -85,6 +85,42 @@ class TestBranchCommandCLI:
         messages = session_db.get_messages_as_conversation(cli_instance.session_id)
         assert len(messages) == 4  # All 4 messages copied
 
+    def test_branch_preserves_context_and_tool_reasoning_metadata(
+        self, cli_instance, session_db
+    ):
+        from cli import HermesCLI
+
+        history = [
+            {"role": "user", "content": "search", "timestamp": 123.0},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+                "finish_reason": "tool_calls",
+                "reasoning": "thinking",
+                "reasoning_content": "scratchpad",
+                "reasoning_details": [{"type": "summary", "text": "step"}],
+                "codex_reasoning_items": [{"id": "r1"}],
+                "codex_message_items": [{"id": "m1"}],
+                "_context_snapshot": True,
+                "timestamp": 124.0,
+            },
+            {
+                "role": "tool",
+                "content": "result",
+                "tool_call_id": "call-1",
+                "tool_name": "search",
+                "_context_snapshot": True,
+                "timestamp": 125.0,
+            },
+        ]
+        cli_instance.conversation_history = history
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        copied = session_db.get_messages_as_conversation(cli_instance.session_id)
+        assert copied == [{**message, "_context_snapshot": True} for message in history]
+
     def test_branch_preserves_parent_link(self, cli_instance, session_db):
         """The new session should reference the original as parent."""
         from cli import HermesCLI
