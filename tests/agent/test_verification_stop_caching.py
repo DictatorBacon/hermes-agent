@@ -21,7 +21,7 @@ import pytest
 
 def _fresh_run_agent(hermes_home):
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("hermes_"):
             del sys.modules[mod]
     import run_agent  # noqa: F401
     return sys.modules["run_agent"]
@@ -108,3 +108,34 @@ def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
     contents = [m.get("content") for m in data["messages"]]
     assert contents == ["hi", "verified and clean"]
     assert all(not m.get("_pre_verify_synthetic") for m in data["messages"])
+
+
+def test_verification_followup_skips_post_tool_compaction():
+    """The attempted final answer must stay intact until verification finishes."""
+    from agent.conversation_loop import _should_compress_after_tool_result
+
+    compressor = MagicMock()
+    compressor.should_compress.return_value = True
+    agent = MagicMock(
+        compression_enabled=True,
+        _verification_stop_nudges=1,
+        _pre_verify_nudges=0,
+    )
+
+    assert not _should_compress_after_tool_result(agent, compressor, 250_000)
+    compressor.should_compress.assert_not_called()
+
+
+def test_normal_tool_turn_can_still_compact():
+    from agent.conversation_loop import _should_compress_after_tool_result
+
+    compressor = MagicMock()
+    compressor.should_compress.return_value = True
+    agent = MagicMock(
+        compression_enabled=True,
+        _verification_stop_nudges=0,
+        _pre_verify_nudges=0,
+    )
+
+    assert _should_compress_after_tool_result(agent, compressor, 250_000)
+    compressor.should_compress.assert_called_once_with(250_000)

@@ -520,6 +520,25 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _should_compress_after_tool_result(agent, compressor, real_tokens: int) -> bool:
+    """Gate post-tool compaction without risking verification-loop answers.
+
+    Verification continuations keep an attempted final answer plus synthetic
+    nudge in memory until checks finish. Compacting that transient sequence can
+    summarize away the real answer, so defer compaction for the remainder of
+    that turn. Turn initialization resets both counters before the next user
+    request.
+    """
+    if not agent.compression_enabled:
+        return False
+    if (
+        getattr(agent, "_verification_stop_nudges", 0) > 0
+        or getattr(agent, "_pre_verify_nudges", 0) > 0
+    ):
+        return False
+    return compressor.should_compress(real_tokens)
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -4766,7 +4785,9 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                if _should_compress_after_tool_result(
+                    agent, _compressor, _real_tokens
+                ):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,

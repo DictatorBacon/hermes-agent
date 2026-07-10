@@ -194,35 +194,43 @@ async def test_branch_clears_session_scoped_approval_and_yolo_state():
 
 
 @pytest.mark.asyncio
-async def test_branch_preserves_persisted_assistant_metadata():
+async def test_branch_preserves_complete_message_metadata():
     runner, _session_key = _make_branch_runner()
-    runner.session_store.load_transcript.return_value = [
-        {"role": "user", "content": "hello"},
+    history = [
+        {"role": "user", "content": "hello", "timestamp": 123.0},
         {
             "role": "assistant",
-            "content": "world",
-            "finish_reason": "stop",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+            "finish_reason": "tool_calls",
             "reasoning": "thinking",
             "reasoning_content": "provider scratchpad",
             "reasoning_details": [{"type": "summary", "text": "step"}],
             "codex_reasoning_items": [{"id": "r1", "type": "reasoning"}],
             "codex_message_items": [{"id": "m1", "type": "message"}],
+            "_context_snapshot": True,
+            "timestamp": 124.0,
+        },
+        {
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "tool_name": "search",
+            "_context_snapshot": True,
+            "timestamp": 125.0,
         },
     ]
+    runner.session_store.load_transcript.return_value = history
 
     result = await runner._handle_branch_command(_make_event("/branch"))
 
     assert "Branched to" in result
-    append_calls = runner._session_db._db.append_message.call_args_list
-    assert len(append_calls) == 2
-    assistant_kwargs = append_calls[1].kwargs
-    assert assistant_kwargs["role"] == "assistant"
-    assert assistant_kwargs["finish_reason"] == "stop"
-    assert assistant_kwargs["reasoning"] == "thinking"
-    assert assistant_kwargs["reasoning_content"] == "provider scratchpad"
-    assert assistant_kwargs["reasoning_details"] == [{"type": "summary", "text": "step"}]
-    assert assistant_kwargs["codex_reasoning_items"] == [{"id": "r1", "type": "reasoning"}]
-    assert assistant_kwargs["codex_message_items"] == [{"id": "m1", "type": "message"}]
+    copied_id, copied_history = runner._session_db._db.replace_messages.call_args.args
+    created_id = runner._session_db._db.create_session.call_args.kwargs["session_id"]
+    assert copied_id == created_id
+    assert copied_history == [
+        {**message, "_context_snapshot": True} for message in history
+    ]
 
 
 def test_clear_session_boundary_security_state_is_scoped():

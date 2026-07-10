@@ -12,7 +12,7 @@ exactly as before.
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -50,12 +50,20 @@ def _make_agent(session_db, session_id, *, in_place):
 def _seed(db, sid, title, n=8):
     db.create_session(sid, "cli", model="test/model")
     db.set_session_title(sid, title)
+    messages = []
     for i in range(n):
+        message = {
+            "role": "user" if i % 2 == 0 else "assistant",
+            "content": f"msg {i}",
+            "_db_persisted": True,
+        }
+        messages.append(message)
         db.append_message(
             session_id=sid,
-            role="user" if i % 2 == 0 else "assistant",
-            content=f"msg {i}",
+            role=message["role"],
+            content=message["content"],
         )
+    return messages
 
 
 class TestInPlaceCompaction:
@@ -67,11 +75,10 @@ class TestInPlaceCompaction:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_120000_aaaaaa"
-            _seed(db, sid, "my-research")
+            messages = _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
             compressed, _sp = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -123,6 +130,7 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+            db.close()
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
@@ -132,20 +140,18 @@ class TestInPlaceCompaction:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_120500_cccccc"
-            _seed(db, sid, "alt")
+            messages = _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
             roles = [m["role"] for m in compressed if m.get("role") != "system"]
             assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
+            db.close()
 
-    def test_in_place_skips_redundant_preflush(self):
-        """In-place must NOT pre-flush current-turn messages: replace_messages
-        rewrites the whole row, so a flush would INSERT rows it immediately
-        deletes (wasted writes). The current-turn tail survives via the
-        compressor's `compressed` output, not the flush."""
+    def test_in_place_preflushes_pending_messages(self):
+        """In-place compaction must durably flush the current turn before the
+        compacted replay snapshot is hidden from the visible transcript."""
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
@@ -161,7 +167,254 @@ class TestInPlaceCompaction:
                 agent, [{"role": "user", "content": "x"}] * 8,
                 approx_tokens=100_000, system_message="sys",
             )
-            assert calls["n"] == 0
+            db.close()
+            assert calls["n"] == 1
+
+    def test_in_place_preflush_keeps_pending_tool_result_visible(self):
+        """A just-produced tool result must survive as durable visible history.
+
+        The compressor's returned rows are model-context snapshots and therefore
+        hidden from display. Without the preflush, a tool result that only exists
+        in memory disappears from the human transcript during in-place archival.
+        """
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "ip_tool_result"
+            db.create_session(sid, "cli", model="test/model")
+            tool_calls = [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "date", "arguments": "{}"},
+                }
+            ]
+            db.append_message(sid, "user", "What time is it?")
+            db.append_message(
+                sid,
+                "assistant",
+                "",
+                tool_calls=tool_calls,
+                finish_reason="tool_calls",
+            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": "What time is it?",
+                    "_db_persisted": True,
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": tool_calls,
+                    "finish_reason": "tool_calls",
+                    "_db_persisted": True,
+                },
+                {
+                    "role": "tool",
+                    "content": "Thursday, July 9, 2026",
+                    "tool_call_id": "call_1",
+                    "tool_name": "date",
+                },
+            ]
+            agent = _make_agent(db, sid, in_place=True)
+
+            compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            visible = db.get_messages_for_display(sid)
+            db.close()
+            assert [(m["role"], m.get("content")) for m in visible] == [
+                ("user", "What time is it?"),
+                ("assistant", ""),
+                ("tool", "Thursday, July 9, 2026"),
+            ]
+
+    def test_display_transcript_preserves_message_content_bytes(self):
+        """Display retrieval must not trim Markdown-significant whitespace.
+
+        The browser renders streamed content before reloading canonical history.
+        If this getter strips the persisted bytes, the same response visibly
+        changes after the post-stream reload.
+        """
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = db.create_session("display-bytes", "api_server")
+            content = "    indented markdown\n\n```python\n    x = 1\n```\n\n"
+            db.append_message(sid, "assistant", content)
+
+            visible = db.get_messages_for_display(sid)
+            db.close()
+
+        assert visible[0]["content"] == content
+
+    def test_display_keeps_legitimate_whitespace_prefixed_legacy_marker(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = db.create_session("display-marker-quote", "api_server")
+            content = (
+                "  [Your active task list was preserved across context compression]\n"
+                "This is user-authored quoted text, not a replay snapshot."
+            )
+            db.append_message(sid, "user", content)
+            visible = db.get_messages_for_display(sid)
+            db.close()
+
+        assert [message["content"] for message in visible] == [content]
+
+    def test_display_keeps_legitimate_exact_legacy_marker(self):
+        """Ambiguous legacy text must stay visible when provenance is unknown."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = db.create_session("display-exact-marker", "api_server")
+            content = (
+                "[Your active task list was preserved across context compression]\n"
+                "This is a genuine user message."
+            )
+            db.append_message(sid, "user", content)
+            visible = db.get_messages_for_display(sid)
+            db.close()
+
+        assert [message["content"] for message in visible] == [content]
+
+    def test_prompt_rebuild_observes_memory_committed_at_boundary(self):
+        """The continuation prompt must include memory produced by compaction."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "memory-prompt-boundary"
+            messages = _seed(db, sid, "memory")
+            agent = _make_agent(db, sid, in_place=True)
+            state = {"memory": "before"}
+            agent._cached_system_prompt = "stable prompt prefix"
+            agent._build_system_prompt = MagicMock(
+                side_effect=lambda _message: f"prompt with memory-{state['memory']}"
+            )
+
+            def commit_memory(_messages):
+                state["memory"] = "after"
+
+            agent.commit_memory_session = commit_memory
+
+            _compressed, system_prompt = compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+            persisted = db.get_session(sid)["system_prompt"]
+            db.close()
+
+        assert system_prompt == "prompt with memory-after"
+        assert agent._cached_system_prompt == "prompt with memory-after"
+        assert persisted == "prompt with memory-after"
+
+    @pytest.mark.parametrize("in_place", [True, False])
+    def test_failed_preflush_preserves_prompt_cache(self, in_place):
+        """Cancelled compaction is a strict no-op for the prompt cache prefix."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = db.create_session("flush-failure", "api_server")
+            messages = [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer"},
+            ]
+            agent = _make_agent(db, sid, in_place=in_place)
+            agent._cached_system_prompt = "stable prompt prefix"
+            agent._flush_messages_to_session_db = MagicMock(return_value=False)
+            agent._invalidate_system_prompt = MagicMock()
+            agent._build_system_prompt = MagicMock(return_value="rebuilt prompt")
+
+            result, system_prompt = compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+            db.close()
+
+        assert result is messages
+        assert system_prompt == "stable prompt prefix"
+        assert agent._cached_system_prompt == "stable prompt prefix"
+        agent._invalidate_system_prompt.assert_not_called()
+
+    @pytest.mark.parametrize("in_place", [True, False])
+    def test_prompt_failure_cannot_commit_compaction_boundary(self, in_place):
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "prompt-failure"
+            messages = _seed(db, sid, "atomic")
+            agent = _make_agent(db, sid, in_place=in_place)
+            agent._cached_system_prompt = "stable prompt prefix"
+            agent._flush_messages_to_session_db = MagicMock(return_value=True)
+            agent.commit_memory_session = MagicMock()
+            agent._build_system_prompt = MagicMock(
+                side_effect=RuntimeError("prompt rebuild failed")
+            )
+
+            result, system_prompt = compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+            rows = db.get_messages(sid, include_inactive=True)
+            children = db._conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall()
+            root = db.get_session(sid)
+            db.close()
+
+        assert result is messages
+        assert system_prompt == "stable prompt prefix"
+        assert all(row["active"] and not row["compacted"] for row in rows)
+        assert children == []
+        assert root["end_reason"] is None
+        assert agent.session_id == sid
+        agent.commit_memory_session.assert_not_called()
+
+    def test_compressor_copy_without_summary_window_is_strict_noop(self):
+        from agent.context_compressor import ContextCompressor
+
+        with patch(
+            "agent.context_compressor.get_model_context_length", return_value=100_000
+        ):
+            compressor = ContextCompressor(model="test/model", quiet_mode=True)
+        messages = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": str(i)}
+            for i in range(10)
+        ]
+        compressor._prune_old_tool_results = MagicMock(
+            return_value=(list(messages), 1)
+        )
+        compressor._protect_head_size = MagicMock(return_value=3)
+        compressor._align_boundary_forward = MagicMock(return_value=3)
+        compressor._protect_active_user_boundary = MagicMock(return_value=3)
+        compressor._find_tail_cut_by_tokens = MagicMock(return_value=3)
+
+        result = compressor.compress(messages, current_tokens=100_000)
+
+        assert result is messages
 
     def test_rotation_still_preflushes(self):
         """Rotation MUST pre-flush so current-turn messages survive in the
@@ -182,6 +435,7 @@ class TestInPlaceCompaction:
                 approx_tokens=100_000, system_message="sys",
             )
             assert calls["n"] == 1
+            db.close()
 
 
 class TestRotationFallbackWhenFlagOff:
@@ -195,11 +449,10 @@ class TestRotationFallbackWhenFlagOff:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             sid = "20260619_130000_bbbbbb"
-            _seed(db, sid, "my-research")
+            messages = _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=False)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
             compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -217,6 +470,7 @@ class TestRotationFallbackWhenFlagOff:
             assert agent._last_flushed_db_idx == 0
             # Rotation mode does NOT set the in-place signal.
             assert getattr(agent, "_last_compaction_in_place", False) is False
+            db.close()
 
 
 class TestInPlaceSignalForGateway:
@@ -230,22 +484,23 @@ class TestInPlaceSignalForGateway:
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
             # in-place → flag True
-            _seed(db, "s_ip", "ip")
+            ip_messages = _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, ip_messages,
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True
 
             # rotation → flag False
-            _seed(db, "s_rot", "rot")
+            rot_messages = _seed(db, "s_rot", "rot")
             a_rot = _make_agent(db, "s_rot", in_place=False)
             compress_context(
-                a_rot, [{"role": "user", "content": "x"}] * 8,
+                a_rot, rot_messages,
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_rot._last_compaction_in_place is False
+            db.close()
 
 
 class TestInPlaceConfigDefault:
@@ -298,6 +553,7 @@ class TestCompactedTurnsStaySearchable:
             assert {m["id"] for m in after} == {1, 4}
             # Live context still excludes them.
             assert len(db.get_messages_as_conversation(sid)) == 2
+            db.close()
 
     def test_rewound_turns_stay_hidden(self):
         """Rewind/undo (active=0, compacted=0) must NOT leak into default
@@ -317,4 +573,5 @@ class TestCompactedTurnsStaySearchable:
                 "ZEBRAWORD", role_filter=["user", "assistant"], include_inactive=True
             )
             assert len(recovered) == 1
+            db.close()
 

@@ -1,5 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
+import json
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -176,6 +178,13 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
     session_db.end_session(source_id, "compression")
     session_db.create_session("tip-session", "api_server", parent_session_id=source_id)
     session_db.append_message("tip-session", "user", "after compression")
+    # A legacy explicit branch may lack _branched_from. Stale-root routing must
+    # still stop at the compression tip rather than following an arbitrary child.
+    session_db.end_session("tip-session", "branched")
+    session_db.create_session(
+        "legacy-branch", "api_server", parent_session_id="tip-session"
+    )
+    session_db.append_message("legacy-branch", "user", "branch-only turn")
 
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
@@ -186,6 +195,40 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
     assert messages["object"] == "list"
     assert messages["session_id"] == "tip-session"
     assert [m["content"] for m in messages["data"]] == ["before compression", "after compression"]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_do_not_prepend_explicit_branch_parent(
+    adapter, session_db
+):
+    """A branch already carries copied history, so display must not concatenate
+    the parent again merely because it has parent_session_id set."""
+    source_id = session_db.create_session("branch-source", "api_server")
+    session_db.append_message(source_id, "user", "one copy only")
+    branch_id = session_db.create_session(
+        "explicit-branch",
+        "api_server",
+        parent_session_id=source_id,
+        model_config={"_branched_from": source_id},
+    )
+    source_history = session_db.get_messages_as_conversation(source_id)
+    session_db.replace_messages(
+        branch_id,
+        [{**message, "_context_snapshot": True} for message in source_history],
+    )
+    session_db.append_message(branch_id, "assistant", "branch-only reply")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{branch_id}/messages")
+        assert response.status == 200
+        payload = await response.json()
+
+    assert payload["session_id"] == branch_id
+    assert [m["content"] for m in payload["data"]] == [
+        "one copy only",
+        "branch-only reply",
+    ]
 
 
 @pytest.mark.asyncio
@@ -230,7 +273,13 @@ async def test_session_messages_include_archived_turns_after_in_place_compaction
 
     session_id = session_db.create_session("display-in-place", "api_server")
     session_db.append_message(session_id, "user", "Original request")
-    session_db.append_message(session_id, "assistant", "Original visible answer")
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "Original visible answer",
+        reasoning="visible reasoning",
+        timestamp=123.0,
+    )
     session_db.archive_and_compact(
         session_id,
         [
@@ -250,6 +299,37 @@ async def test_session_messages_include_archived_turns_after_in_place_compaction
         "Original request",
         "Original visible answer",
         "Continuation after compaction",
+    ]
+    assert payload["data"][1]["timestamp"] == 123.0
+    assert payload["data"][1]["reasoning"] == "visible reasoning"
+    assert all("context_snapshot" not in message for message in payload["data"])
+    assert all("active" not in message for message in payload["data"])
+
+
+@pytest.mark.asyncio
+async def test_session_messages_hide_legacy_todo_snapshot(adapter, session_db):
+    """Pre-marker compaction TODO injections are model state, not chat turns."""
+    session_id = session_db.create_session("display-legacy-todo", "api_server")
+    session_db.append_message(session_id, "user", "Ok, let's proceed forward")
+    session_db.append_message(session_id, "assistant", "Starting the review")
+    session_db.append_message(
+        session_id,
+        "user",
+        "[Your active task list was preserved across context compression]\n"
+        "- [>] review. Review changes (in_progress)",
+    )
+    session_db.append_message(session_id, "assistant", "Review continued")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert response.status == 200
+        payload = await response.json()
+
+    assert [m["content"] for m in payload["data"]] == [
+        "Ok, let's proceed forward",
+        "Starting the review",
+        "Review continued",
     ]
 
 
@@ -322,6 +402,16 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
     session_db.append_message(source_id, "assistant", "answer")
+    session_db.append_message(
+        source_id,
+        "assistant",
+        "replay snapshot",
+        tool_calls=[{"id": "call-1", "type": "function"}],
+        reasoning="thinking",
+        reasoning_details=[{"type": "summary", "text": "step"}],
+        timestamp=123.0,
+        context_snapshot=True,
+    )
 
     app = _create_session_app(adapter)
     async with TestClient(TestServer(app)) as cli:
@@ -334,7 +424,20 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["id"] != source_id
     assert fork["parent_session_id"] == source_id
     assert fork["title"] == "Alternative"
-    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
+    copied = session_db.get_messages_as_conversation(fork["id"])
+    assert [m["content"] for m in copied] == [
+        "first path",
+        "answer",
+        "replay snapshot",
+    ]
+    assert all(message["_context_snapshot"] is True for message in copied)
+    assert copied[-1]["tool_calls"] == [{"id": "call-1", "type": "function"}]
+    assert copied[-1]["reasoning_details"] == [{"type": "summary", "text": "step"}]
+    assert copied[-1]["timestamp"] == 123.0
+    fork_config = session_db.get_session(fork["id"])["model_config"]
+    if isinstance(fork_config, str):
+        fork_config = json.loads(fork_config)
+    assert fork_config["_branched_from"] == source_id
     assert session_db.get_session(source_id)["end_reason"] == "branched"
 
 
@@ -535,6 +638,276 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     assert any(m.get("tool_calls") for m in messages)
 
 
+@pytest.mark.asyncio
+async def test_rotated_stream_completion_excludes_compacted_replay_snapshot(adapter, session_db):
+    """A mid-turn rotation must return only this turn's visible transcript."""
+    import json as _json
+
+    root_id = session_db.create_session("rotation-root", "api_server")
+    session_db.append_message(root_id, "user", "old question")
+    session_db.append_message(root_id, "assistant", "old answer")
+
+    async def fake_run(**kwargs):
+        session_db.end_session(root_id, "compression")
+        child_id = session_db.create_session(
+            "rotation-child", "api_server", parent_session_id=root_id
+        )
+        session_db.append_message(
+            child_id,
+            "assistant",
+            "synthetic compacted summary",
+            context_snapshot=True,
+        )
+        session_db.append_message(child_id, "user", "new question")
+        session_db.append_message(child_id, "assistant", "new answer")
+        kwargs["stream_delta_callback"]("new answer")
+        return {
+            "final_response": "new answer",
+            "session_id": child_id,
+            "messages": [
+                {"role": "assistant", "content": "synthetic compacted summary"},
+                {"role": "user", "content": "new question"},
+                {"role": "assistant", "content": "new answer"},
+            ],
+        }, {"total_tokens": 3}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{root_id}/chat/stream",
+                json={"message": "new question"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    payload = None
+    for block in body.split("\n\n"):
+        if "event: run.completed" not in block:
+            continue
+        for line in block.splitlines():
+            if line.startswith("data: "):
+                payload = _json.loads(line[len("data: "):])
+        break
+
+    assert payload is not None, body
+    assert [
+        (message.get("role"), message.get("content"))
+        for message in payload.get("messages", [])
+    ] == [("assistant", "new answer")]
+
+
+@pytest.mark.asyncio
+async def test_same_session_streams_do_not_mix_completed_transcripts(adapter, session_db):
+    """Concurrent requests for one session must be serialized per session."""
+    session_id = session_db.create_session("concurrent-stream", "api_server")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_run(**kwargs):
+        message = kwargs["user_message"]
+        session_db.append_message(session_id, "user", message)
+        if message == "first":
+            first_started.set()
+            await release_first.wait()
+        answer = f"answer {message}"
+        session_db.append_message(session_id, "assistant", answer)
+        kwargs["stream_delta_callback"](answer)
+        return {
+            "final_response": answer,
+            "session_id": session_id,
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": answer},
+            ],
+        }, {"total_tokens": 2}
+
+    def completed_contents(body):
+        for block in body.split("\n\n"):
+            if "event: run.completed" not in block:
+                continue
+            for line in block.splitlines():
+                if line.startswith("data: "):
+                    payload = json.loads(line[len("data: "):])
+                    return [m.get("content") for m in payload.get("messages", [])]
+        raise AssertionError(body)
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first_task = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={"message": "first"},
+                )
+            )
+            await first_started.wait()
+            second_task = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={"message": "second"},
+                )
+            )
+            await asyncio.sleep(0.05)
+            release_first.set()
+            first_resp, second_resp = await asyncio.gather(first_task, second_task)
+            first_body, second_body = await asyncio.gather(
+                first_resp.text(), second_resp.text()
+            )
+
+    assert completed_contents(first_body) == ["answer first"]
+    assert completed_contents(second_body) == ["answer second"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_does_not_finish_before_worker(adapter):
+    """Cancellation must not release session ownership while a worker still runs."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def worker():
+        started.set()
+        await release.wait()
+        return "done"
+
+    waiter = asyncio.create_task(adapter._await_uncancellable(worker()))
+    await started.wait()
+    waiter.cancel()
+    await asyncio.sleep(0.05)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+
+@pytest.mark.asyncio
+async def test_queued_stream_re_resolves_rotated_lineage_tip(adapter, session_db):
+    root_id = session_db.create_session("queued-root", "api_server")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen = {}
+
+    async def fake_run(**kwargs):
+        message = kwargs["user_message"]
+        if message == "first":
+            first_started.set()
+            await release_first.wait()
+            session_db.end_session(root_id, "compression")
+            child_id = session_db.create_session(
+                "queued-child", "api_server", parent_session_id=root_id
+            )
+            return {"final_response": "first done", "session_id": child_id}, {}
+        seen["second_session_id"] = kwargs["session_id"]
+        return {"final_response": "second done", "session_id": kwargs["session_id"]}, {}
+
+    async def post_and_read(cli, message):
+        response = await cli.post(
+            f"/api/sessions/{root_id}/chat/stream", json={"message": message}
+        )
+        return await response.text()
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(post_and_read(cli, "first"))
+            await first_started.wait()
+            second = asyncio.create_task(post_and_read(cli, "second"))
+            await asyncio.sleep(0.05)
+            release_first.set()
+            await asyncio.gather(first, second)
+
+    assert seen["second_session_id"] == "queued-child"
+
+
+@pytest.mark.asyncio
+async def test_queued_nonstream_chat_re_resolves_rotated_lineage_tip(adapter, session_db):
+    root_id = session_db.create_session("queued-chat-root", "api_server")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen = {}
+
+    async def fake_run(**kwargs):
+        message = kwargs["user_message"]
+        if message == "first":
+            first_started.set()
+            await release_first.wait()
+            session_db.end_session(root_id, "compression")
+            child_id = session_db.create_session(
+                "queued-chat-child", "api_server", parent_session_id=root_id
+            )
+            return {"final_response": "first done", "session_id": child_id}, {}
+        seen["second_session_id"] = kwargs["session_id"]
+        return {"final_response": "second done", "session_id": kwargs["session_id"]}, {}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(f"/api/sessions/{root_id}/chat", json={"message": "first"})
+            )
+            await first_started.wait()
+            second = asyncio.create_task(
+                cli.post(f"/api/sessions/{root_id}/chat", json={"message": "second"})
+            )
+            await asyncio.sleep(0.05)
+            release_first.set()
+            await asyncio.gather(first, second)
+
+    assert seen["second_session_id"] == "queued-chat-child"
+
+
+@pytest.mark.asyncio
+async def test_in_place_compaction_stream_reports_only_current_turn(adapter, session_db):
+    """Archival metadata changes must not trigger stale transcript fallback."""
+    session_id = session_db.create_session("in-place-stream", "api_server")
+    session_db.append_message(session_id, "user", "old question")
+    session_db.append_message(session_id, "assistant", "old answer")
+
+    async def fake_run(**kwargs):
+        session_db.archive_and_compact(
+            session_id,
+            [
+                {
+                    "role": "user",
+                    "content": "[CONTEXT COMPACTION] old summary",
+                    "_context_snapshot": True,
+                }
+            ],
+        )
+        session_db.append_message(session_id, "user", kwargs["user_message"])
+        session_db.append_message(session_id, "assistant", "new answer")
+        return {
+            "final_response": "new answer",
+            "session_id": session_id,
+            "messages": [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+                {"role": "user", "content": kwargs["user_message"]},
+                {"role": "assistant", "content": "new answer"},
+            ],
+        }, {"total_tokens": 2}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "new question"},
+            )
+            body = await response.text()
+
+    completed = next(
+        json.loads(line[len("data: "):])
+        for block in body.split("\n\n")
+        if "event: run.completed" in block
+        for line in block.splitlines()
+        if line.startswith("data: ")
+    )
+    assert [message["content"] for message in completed["messages"]] == [
+        "new answer"
+    ]
+
 
 @pytest.mark.asyncio
 async def test_session_chat_stream_resolves_stale_compression_root(adapter, session_db):
@@ -545,6 +918,11 @@ async def test_session_chat_stream_resolves_stale_compression_root(adapter, sess
     session_db.end_session(root_id, "compression")
     tip_id = session_db.create_session("tip-session", "api_server", parent_session_id=root_id)
     session_db.append_message(tip_id, "user", "hello tip")
+    session_db.end_session(tip_id, "branched")
+    session_db.create_session(
+        "legacy-stream-branch", "api_server", parent_session_id=tip_id
+    )
+    session_db.append_message("legacy-stream-branch", "user", "branch only")
 
     captured_kwargs = {}
 
@@ -575,6 +953,11 @@ async def test_session_chat_resolves_stale_compression_root(adapter, session_db)
     session_db.end_session(root_id, "compression")
     tip_id = session_db.create_session("tip-chat", "api_server", parent_session_id=root_id)
     session_db.append_message(tip_id, "user", "hello tip")
+    session_db.end_session(tip_id, "branched")
+    session_db.create_session(
+        "legacy-chat-branch", "api_server", parent_session_id=tip_id
+    )
+    session_db.append_message("legacy-chat-branch", "user", "branch only")
 
     mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": tip_id}, {"total_tokens": 1}))
     app = _create_session_app(adapter)

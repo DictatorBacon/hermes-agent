@@ -4215,16 +4215,33 @@ class SessionDB:
         from agent.context_compressor import ContextCompressor
 
         session_ids = (
-            self._session_lineage_root_to_tip(session_id)
+            self._compression_lineage_root_to_tip(session_id)
             if include_ancestors
             else [session_id]
         )
         display: List[Dict[str, Any]] = []
+        if include_ancestors and session_ids:
+            # Explicit branches carry their inherited model context as hidden
+            # snapshot rows. Reconstruct the durable visible parent transcript,
+            # then append only genuine branch-local turns below. This preserves
+            # pre-compaction history without treating arbitrary parent/subagent
+            # edges as compression continuations.
+            with self._lock:
+                branch_row = self._conn.execute(
+                    "SELECT json_extract(COALESCE(model_config, '{}'), '$._branched_from') "
+                    "AS parent_id FROM sessions WHERE id = ?",
+                    (session_ids[0],),
+                ).fetchone()
+            branch_parent = branch_row["parent_id"] if branch_row else None
+            if branch_parent and branch_parent not in session_ids:
+                display = self.get_messages_for_display(
+                    branch_parent, include_ancestors=True
+                )
 
         def _signature(msg: Dict[str, Any]) -> str:
             content = msg.get("content")
             if isinstance(content, str):
-                content = sanitize_context(content).strip()
+                content = sanitize_context(content)
             return json.dumps(
                 {
                     "role": msg.get("role"),
@@ -4238,12 +4255,12 @@ class SessionDB:
                 default=str,
             )
 
-        def _append_sanitized(rows: List[Dict[str, Any]]) -> None:
+        def _append_rows(rows: List[Dict[str, Any]]) -> None:
             for raw in rows:
                 row = dict(raw)
                 content = row.get("content")
                 if isinstance(content, str):
-                    row["content"] = sanitize_context(content).strip()
+                    row["content"] = sanitize_context(content)
                 display.append(row)
 
         def _prefix_overlap(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> int:
@@ -4263,11 +4280,33 @@ class SessionDB:
                     return size
             return 0
 
+        def _is_legacy_todo_snapshot(content: Any) -> bool:
+            """Recognize the old TodoStore injection shape conservatively.
+
+            The marker alone is valid user text. Legacy snapshots additionally
+            contain only generated checklist rows, which gives us enough
+            structure to hide known model-state injections without deleting an
+            arbitrary message that merely quotes the marker.
+            """
+            if not isinstance(content, str):
+                return False
+            lines = content.splitlines()
+            if not lines or lines[0] != (
+                "[Your active task list was preserved across context compression]"
+            ):
+                return False
+            task_lines = [line for line in lines[1:] if line.strip()]
+            return bool(task_lines) and all(
+                re.match(r"^- \[(?: |>|x)\] .+ \([a-z_]+\)$", line)
+                for line in task_lines
+            )
+
         for lineage_id in session_ids:
             rows = [
                 row for row in self.get_messages(lineage_id, include_inactive=True)
                 if (row.get("active", 1) or row.get("compacted", 0))
                 and not row.get("context_snapshot")
+                and not _is_legacy_todo_snapshot(row.get("content"))
             ]
 
             # Legacy snapshots predate context_snapshot. Split on each handoff
@@ -4282,7 +4321,7 @@ class SessionDB:
                     segments[-1].append(row)
 
             if len(segments) == 1:
-                _append_sanitized(segments[0])
+                _append_rows(segments[0])
                 continue
 
             for index, segment in enumerate(segments):
@@ -4305,9 +4344,59 @@ class SessionDB:
                         ):
                             candidate = candidate[:-size]
                             break
-                _append_sanitized(candidate)
+                _append_rows(candidate)
 
         return _strip_background_review_harness(display)
+
+    def get_compression_lineage_root(self, session_id: str) -> str:
+        """Return the stable lock/routing key for a compression lineage."""
+        chain = self._compression_lineage_root_to_tip(session_id)
+        return chain[0] if chain else session_id
+
+    def _compression_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        """Return only parent edges created by compression rotation.
+
+        Explicit branches copy their inherited history into the child, so walking
+        every ``parent_session_id`` ancestor would render that copied history a
+        second time. A compression continuation is identified by the same edge
+        conditions used by :meth:`get_compression_tip`.
+        """
+        if not session_id:
+            return [session_id]
+
+        chain: List[str] = []
+        current = session_id
+        seen = set()
+        with self._lock:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                chain.append(current)
+                row = self._conn.execute(
+                    """
+                    SELECT child.parent_session_id
+                    FROM sessions AS child
+                    JOIN sessions AS parent
+                      ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                      AND parent.end_reason = 'compression'
+                      AND COALESCE(json_extract(child.model_config, '$._branched_from'), '') = ''
+                      AND COALESCE(json_extract(child.model_config, '$._delegate_from'), '') = ''
+                      AND COALESCE(child.source, '') != 'tool'
+                    """,
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                current = (
+                    row["parent_session_id"]
+                    if hasattr(row, "keys")
+                    else row[0]
+                )
+
+        chain.reverse()
+        return chain or [session_id]
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
