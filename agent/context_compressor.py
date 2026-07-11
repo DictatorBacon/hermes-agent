@@ -84,6 +84,21 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # poisoning every subsequent request in the session — a bare key like
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+_DB_PERSISTED_MARKER = "_db_persisted"
+
+
+def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a message for compaction without inherited DB flush state."""
+    fresh = msg.copy()
+    fresh.pop(_DB_PERSISTED_MARKER, None)
+    return fresh
+
+
+def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
+    """Ensure a compacted transcript can be persisted into a new session."""
+    for message in messages:
+        if isinstance(message, dict):
+            message.pop(_DB_PERSISTED_MARKER, None)
 
 # Appended to every standalone summary message (and to the merged-into-tail
 # prefix) so the model has an unambiguous "summary ends here" boundary.
@@ -2867,7 +2882,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Phase 4: Assemble compressed message list
         compressed = []
         for i in range(compress_start):
-            msg = messages[i].copy()
+            msg = _fresh_compaction_message_copy(messages[i])
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
                 _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
@@ -2940,7 +2955,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             })
 
         for i in range(compress_end, n_messages):
-            msg = messages[i].copy()
+            msg = _fresh_compaction_message_copy(messages[i])
             if _merge_summary_into_tail and i == compress_end:
                 # Merge the summary into the first tail message, but place
                 # the END MARKER at the very end so the model sees an
