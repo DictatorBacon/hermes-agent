@@ -1215,6 +1215,12 @@ class APIServerAdapter(BasePlatformAdapter):
         elif requested_model:
             model = requested_model
 
+        request_overrides: Dict[str, Any] = {}
+        if service_tier == "priority":
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            request_overrides = resolve_fast_mode_overrides(model) or {}
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
@@ -1242,6 +1248,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
+            request_overrides=request_overrides,
             gateway_session_key=gateway_session_key,
         )
         return agent

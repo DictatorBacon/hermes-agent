@@ -155,7 +155,9 @@ class TestApiServerAdapterToolset:
             kwargs = mock_agent_cls.call_args.kwargs
             assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
             assert kwargs["service_tier"] == "priority"
+            assert kwargs["request_overrides"] == {"service_tier": "priority"}
 
             mock_agent_cls.reset_mock()
             adapter._create_agent(service_tier_override="normal")
             assert mock_agent_cls.call_args.kwargs["service_tier"] is None
+            assert mock_agent_cls.call_args.kwargs["request_overrides"] == {}
