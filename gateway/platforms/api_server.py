@@ -1645,11 +1645,55 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = self._ensure_session_db()
         resolved_id = db.get_compression_tip(session_id) or session_id
-        messages = db.get_messages_for_display(resolved_id, include_ancestors=True)
+        limit_raw = request.query.get("limit")
+        before_raw = request.query.get("before")
+        if limit_raw is None and before_raw is None:
+            messages = db.get_messages_for_display(
+                resolved_id, include_ancestors=True
+            )
+            return web.json_response({
+                "object": "list",
+                "session_id": resolved_id,
+                "data": [self._message_response(m) for m in messages],
+            })
+
+        try:
+            limit = int(limit_raw or 50)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit < 1 or limit > 500:
+            return web.json_response(
+                _openai_error(
+                    "limit must be an integer between 1 and 500",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+        before = None
+        if before_raw is not None:
+            match = re.fullmatch(r"v1:(\d{1,20})", before_raw)
+            before = int(match.group(1)) if match else -1
+            if before < 0:
+                return web.json_response(
+                    _openai_error(
+                        "before must be a valid message cursor",
+                        code="invalid_pagination",
+                    ),
+                    status=400,
+                )
+
+        page = db.get_messages_for_display_page(
+            resolved_id,
+            limit=limit,
+            before=before,
+            include_ancestors=True,
+        )
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [self._message_response(m) for m in page["data"]],
+            "has_more": page["has_more"],
+            "next_cursor": page["next_cursor"],
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
