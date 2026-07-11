@@ -538,6 +538,8 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
                     "system_message": "stay focused",
                     "model": "gpt-5.5",
                     "provider": "openai-codex",
+                    "reasoning_effort": "xhigh",
+                    "service_tier": "priority",
                 },
                 headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "client-42"},
             )
@@ -557,6 +559,8 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     assert kwargs["ephemeral_system_prompt"] == "stay focused"
     assert kwargs["model_override"] == "gpt-5.5"
     assert kwargs["provider_override"] == "openai-codex"
+    assert kwargs["reasoning_effort_override"] == "xhigh"
+    assert kwargs["service_tier_override"] == "priority"
     history = kwargs["conversation_history"]
     assert len(history) == 2
     assert isinstance(history[0].pop("timestamp"), (int, float))
@@ -632,7 +636,10 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     session_id = session_db.create_session("stream-session", "api_server")
     session_db.set_session_title(session_id, "Stream")
 
+    captured = {}
+
     async def fake_run(**kwargs):
+        captured.update(kwargs)
         kwargs["stream_delta_callback"]("Hello")
         kwargs["stream_delta_callback"](" world")
         kwargs["tool_progress_callback"]("reasoning.available", tool_name="_thinking", preview="thinking")
@@ -641,7 +648,14 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     app = _create_session_app(adapter)
     with patch.object(adapter, "_run_agent", side_effect=fake_run):
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "stream please"})
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={
+                    "message": "stream please",
+                    "reasoning_effort": "low",
+                    "service_tier": "normal",
+                },
+            )
             assert resp.status == 200
             assert resp.headers["Content-Type"].startswith("text/event-stream")
             body = await resp.text()
@@ -654,6 +668,8 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: done" in body
+    assert captured["reasoning_effort_override"] == "low"
+    assert captured["service_tier_override"] == "normal"
 
 
 @pytest.mark.asyncio
@@ -721,6 +737,35 @@ async def test_session_chat_rejects_non_string_provider(adapter, session_db):
         assert resp.status == 400
         data = await resp.json()
         assert data["error"]["code"] == "invalid_provider"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runtime_field", "runtime_value", "error_code"),
+    [
+        ("reasoning_effort", "ultra", "invalid_reasoning_effort"),
+        ("reasoning_effort", {"bad": "shape"}, "invalid_reasoning_effort"),
+        ("service_tier", "turbo", "invalid_service_tier"),
+        ("service_tier", True, "invalid_service_tier"),
+    ],
+)
+async def test_session_chat_rejects_invalid_runtime_controls(
+    adapter,
+    session_db,
+    runtime_field,
+    runtime_value,
+    error_code,
+):
+    session_id = session_db.create_session("bad-runtime-session", "api_server")
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/chat",
+            json={"message": "hello", runtime_field: runtime_value},
+        )
+        assert resp.status == 400
+        data = await resp.json()
+        assert data["error"]["code"] == error_code
 
 
 @pytest.mark.asyncio

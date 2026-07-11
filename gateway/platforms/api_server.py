@@ -364,6 +364,61 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _session_chat_runtime_overrides(
+    body: Dict[str, Any],
+) -> tuple[Optional[str], Optional[str], Optional["web.Response"]]:
+    """Validate per-request reasoning and priority-processing controls."""
+    reasoning_effort = body.get("reasoning_effort")
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str):
+            return None, None, web.json_response(
+                _openai_error(
+                    "reasoning_effort must be a string",
+                    code="invalid_reasoning_effort",
+                ),
+                status=400,
+            )
+        reasoning_effort = reasoning_effort.strip().lower()
+        if reasoning_effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            return None, None, web.json_response(
+                _openai_error(
+                    "reasoning_effort must be one of: none, minimal, low, medium, high, xhigh",
+                    code="invalid_reasoning_effort",
+                ),
+                status=400,
+            )
+
+    service_tier = body.get("service_tier")
+    if service_tier is not None:
+        if not isinstance(service_tier, str):
+            return None, None, web.json_response(
+                _openai_error(
+                    "service_tier must be a string",
+                    code="invalid_service_tier",
+                ),
+                status=400,
+            )
+        service_tier = service_tier.strip().lower()
+        tier_aliases = {
+            "fast": "priority",
+            "priority": "priority",
+            "normal": "normal",
+            "default": "normal",
+            "standard": "normal",
+        }
+        if service_tier not in tier_aliases:
+            return None, None, web.json_response(
+                _openai_error(
+                    "service_tier must be one of: priority, fast, normal, default, standard",
+                    code="invalid_service_tier",
+                ),
+                status=400,
+            )
+        service_tier = tier_aliases[service_tier]
+
+    return reasoning_effort, service_tier, None
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1084,6 +1139,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
         provider_override: Optional[str] = None,
+        reasoning_effort_override: Optional[str] = None,
+        service_tier_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1112,6 +1169,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
+        service_tier = GatewayRunner._load_service_tier()
+        if reasoning_effort_override is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_config = parse_reasoning_effort(reasoning_effort_override)
+        if service_tier_override is not None:
+            service_tier = "priority" if service_tier_override == "priority" else None
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -1177,6 +1241,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
+            service_tier=service_tier,
             gateway_session_key=gateway_session_key,
         )
         return agent
@@ -1780,6 +1845,11 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_override = body.get("provider") or body.get("model_provider")
         if provider_override is not None and not isinstance(provider_override, str):
             return web.json_response(_openai_error("provider must be a string", code="invalid_provider"), status=400)
+        reasoning_effort_override, service_tier_override, runtime_err = (
+            _session_chat_runtime_overrides(body)
+        )
+        if runtime_err is not None:
+            return runtime_err
         lineage_lock_id = db.get_compression_lineage_root(session_id)
         async with self._session_chat_lock(lineage_lock_id):
             session_id = db.get_compression_tip(session_id) or session_id
@@ -1793,6 +1863,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     model_override=model_override,
                     provider_override=provider_override,
+                    reasoning_effort_override=reasoning_effort_override,
+                    service_tier_override=service_tier_override,
                 )
             )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -1839,6 +1911,11 @@ class APIServerAdapter(BasePlatformAdapter):
         provider_override = body.get("provider") or body.get("model_provider")
         if provider_override is not None and not isinstance(provider_override, str):
             return web.json_response(_openai_error("provider must be a string", code="invalid_provider"), status=400)
+        reasoning_effort_override, service_tier_override, runtime_err = (
+            _session_chat_runtime_overrides(body)
+        )
+        if runtime_err is not None:
+            return runtime_err
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -1915,6 +1992,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         model_override=model_override,
                         provider_override=provider_override,
+                        reasoning_effort_override=reasoning_effort_override,
+                        service_tier_override=service_tier_override,
                         agent_ref=agent_ref,
                     )
                 )
@@ -4070,6 +4149,8 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         model_override: Optional[str] = None,
         provider_override: Optional[str] = None,
+        reasoning_effort_override: Optional[str] = None,
+        service_tier_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4103,6 +4184,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     model_override=model_override,
                     provider_override=provider_override,
+                    reasoning_effort_override=reasoning_effort_override,
+                    service_tier_override=service_tier_override,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent

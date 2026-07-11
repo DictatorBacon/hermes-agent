@@ -124,3 +124,38 @@ class TestApiServerAdapterToolset:
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert sorted(toolsets) == ["terminal", "web"]
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_applies_request_runtime_controls(self):
+        """Per-request reasoning and Fast settings reach the provider agent."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model", return_value="gpt-5.6-sol"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_kwargs.return_value = {
+                "api_key": "test-key",
+                "base_url": None,
+                "provider": "openai-codex",
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            }
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(
+                reasoning_effort_override="xhigh",
+                service_tier_override="priority",
+            )
+
+            kwargs = mock_agent_cls.call_args.kwargs
+            assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+            assert kwargs["service_tier"] == "priority"
+
+            mock_agent_cls.reset_mock()
+            adapter._create_agent(service_tier_override="normal")
+            assert mock_agent_cls.call_args.kwargs["service_tier"] is None
