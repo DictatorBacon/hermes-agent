@@ -3877,11 +3877,16 @@ class SessionDB:
                     branch_parent, include_ancestors=True
                 )
 
+        signature_cache: Dict[int, str] = {}
+
         def _signature(msg: Dict[str, Any]) -> str:
+            message_id = msg.get("id")
+            if isinstance(message_id, int) and message_id in signature_cache:
+                return signature_cache[message_id]
             content = msg.get("content")
             if isinstance(content, str):
                 content = sanitize_context(content)
-            return json.dumps(
+            signature = json.dumps(
                 {
                     "role": msg.get("role"),
                     "content": content,
@@ -3893,6 +3898,9 @@ class SessionDB:
                 ensure_ascii=False,
                 default=str,
             )
+            if isinstance(message_id, int):
+                signature_cache[message_id] = signature
+            return signature
 
         def _append_rows(rows: List[Dict[str, Any]]) -> None:
             for raw in rows:
@@ -3986,6 +3994,39 @@ class SessionDB:
                 _append_rows(candidate)
 
         return _strip_background_review_harness(display)
+
+    def get_messages_for_display_page(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        before: Optional[int] = None,
+        include_ancestors: bool = False,
+    ) -> Dict[str, Any]:
+        """Return one newest-first cursor page of the durable display transcript.
+
+        ``data`` remains chronological within the page. ``before`` is an
+        absolute boundary in the append-only display projection. The opaque
+        cursor therefore stays stable when newer rows are appended while the
+        user is scrolling through older history.
+        """
+        messages = [
+            message
+            for message in self.get_messages_for_display(
+                session_id, include_ancestors=include_ancestors
+            )
+            if message.get("role") in {"user", "assistant"}
+        ]
+        end = len(messages) if before is None else min(before, len(messages))
+        start = max(0, end - limit)
+        page = messages[start:end]
+        has_more = start > 0
+        next_cursor = f"v1:{start}" if has_more else None
+        return {
+            "data": page,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
 
     def get_compression_lineage_root(self, session_id: str) -> str:
         """Return the stable lock/routing key for a compression lineage."""
