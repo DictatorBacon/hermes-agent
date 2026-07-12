@@ -405,6 +405,28 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_uses_configured_priority_service_tier(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("tools.delegate_tool._load_config", return_value={"service_tier": "priority"}), \
+                patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Use fast mode",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["service_tier"], "priority")
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()

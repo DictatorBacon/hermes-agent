@@ -1272,6 +1272,21 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    # Delegates do not inherit the parent's per-session /fast toggle. Allow an
+    # explicit delegation service tier so workers can consistently use OpenAI
+    # Priority Processing regardless of the parent session's runtime state.
+    delegation_tier = str(delegation_cfg.get("service_tier") or "").strip().lower()
+    if delegation_tier in {"priority", "fast"}:
+        child_service_tier = "priority"
+    elif delegation_tier in {"", "normal", "default", "standard"}:
+        child_service_tier = None
+    else:
+        logger.warning(
+            "Unknown delegation.service_tier '%s', using normal processing",
+            delegation_tier,
+        )
+        child_service_tier = None
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -1310,6 +1325,7 @@ def _build_child_agent(
         max_iterations=max_iterations,
         max_tokens=getattr(parent_agent, "max_tokens", None),
         reasoning_config=child_reasoning,
+        service_tier=child_service_tier,
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
