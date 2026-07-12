@@ -4016,6 +4016,7 @@ class SessionDB:
                 session_id, include_ancestors=include_ancestors
             )
             if message.get("role") in {"user", "assistant"}
+            and message.get("content") not in (None, "", [])
         ]
         end = len(messages) if before is None else min(before, len(messages))
         start = max(0, end - limit)
