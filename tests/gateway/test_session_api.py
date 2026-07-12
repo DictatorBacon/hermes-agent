@@ -255,6 +255,53 @@ async def test_session_messages_paginate_newest_first_across_compression_lineage
 
 
 @pytest.mark.asyncio
+async def test_session_messages_do_not_let_tool_call_scaffolding_crowd_out_chat_turns(
+    adapter, session_db
+):
+    session_id = session_db.create_session("paged-tool-run", "api_server")
+    session_db.append_message(session_id, "user", "previous request")
+    session_db.append_message(session_id, "assistant", "previous reply")
+    session_db.append_message(session_id, "user", "current request")
+    for index in range(8):
+        call_id = f"call-{index}"
+        session_db.append_message(
+            session_id,
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        )
+        session_db.append_message(
+            session_id,
+            "tool",
+            "internal tool output",
+            tool_call_id=call_id,
+            tool_name="terminal",
+        )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=3"
+        )
+        assert response.status == 200
+        page = await response.json()
+
+    assert [(message["role"], message["content"]) for message in page["data"]] == [
+        ("user", "previous request"),
+        ("assistant", "previous reply"),
+        ("user", "current request"),
+    ]
+    assert page["has_more"] is False
+    assert page["next_cursor"] is None
+
+
+@pytest.mark.asyncio
 async def test_session_messages_reject_invalid_pagination(adapter, session_db):
     session_id = session_db.create_session("paged-invalid", "api_server")
     app = _create_session_app(adapter)
