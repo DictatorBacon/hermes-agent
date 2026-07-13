@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -3995,6 +3996,161 @@ class SessionDB:
 
         return _strip_background_review_harness(display)
 
+    @staticmethod
+    def _display_messages_with_activity(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Attach durable tool activity and intermediate reasoning to visible replies."""
+        visible: List[Dict[str, Any]] = []
+        pending_tools: List[Dict[str, Any]] = []
+        tools_by_id: Dict[str, Dict[str, Any]] = {}
+        pending_reasoning = ""
+        pending_host: Optional[Dict[str, Any]] = None
+        pending_scaffold: Optional[Dict[str, Any]] = None
+
+        def reset_turn_activity() -> None:
+            nonlocal pending_reasoning, pending_host, pending_scaffold
+            pending_tools.clear()
+            tools_by_id.clear()
+            pending_reasoning = ""
+            pending_host = None
+            pending_scaffold = None
+
+        def display_copy(message: Dict[str, Any]) -> Dict[str, Any]:
+            copied = dict(message)
+            copied.pop("tool_calls", None)
+            copied.pop("reasoning", None)
+            copied.pop("reasoning_content", None)
+            return copied
+
+        def flush_incomplete_activity() -> None:
+            if not pending_tools:
+                return
+            target = pending_host
+            if target is None and pending_scaffold is not None:
+                target = dict(pending_scaffold)
+                target["content"] = target.get("content") or ""
+                visible.append(target)
+            if target is None:
+                return
+            if pending_reasoning:
+                target["reasoning_content"] = pending_reasoning
+            target["tool_activity"] = [dict(activity) for activity in pending_tools]
+
+        def tool_result_failed(result: Any, depth: int = 0) -> bool:
+            if depth > 2:
+                return False
+            if isinstance(result, str):
+                lowered = result.strip().lower()
+                return lowered.startswith((
+                    "error", "exception", "traceback", "timeout", "timed out",
+                    "cancelled", "canceled", "blocked", "rejected", "denied",
+                    "[tool execution cancelled", "[tool execution canceled",
+                ))
+            if not isinstance(result, dict):
+                return False
+            if result.get("success") is False or result.get("ok") is False:
+                return True
+            status = str(result.get("status") or "").lower()
+            if status in {
+                "error", "failed", "failure", "timeout", "timed_out", "timed-out",
+                "cancelled", "canceled", "blocked", "rejected", "denied",
+            } or result.get("error"):
+                return True
+            exit_code = result.get("exit_code")
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+                return True
+            return any(
+                tool_result_failed(result.get(key), depth + 1)
+                for key in ("result", "data", "details")
+                if key in result
+            )
+
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role == "user" and content not in (None, "", []):
+                flush_incomplete_activity()
+                reset_turn_activity()
+                visible.append(display_copy(message))
+                continue
+
+            if role == "assistant":
+                reasoning_segments = []
+                for key in ("reasoning_content", "reasoning"):
+                    value = message.get(key)
+                    if isinstance(value, str) and value.strip() and value.strip() not in reasoning_segments:
+                        reasoning_segments.append(value.strip())
+                for segment in reasoning_segments:
+                    pending_reasoning = (
+                        f"{pending_reasoning}\n\n{segment}" if pending_reasoning else segment
+                    )[:100_000]
+                tool_calls = message.get("tool_calls")
+                tool_calls = tool_calls if isinstance(tool_calls, list) else []
+                tool_count_before = len(pending_tools)
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict) or len(pending_tools) >= 100:
+                        continue
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    call_id = tool_call.get("id") or tool_call.get("call_id")
+                    name = function.get("name")
+                    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+                        continue
+                    preview = ""
+                    arguments = function.get("arguments")
+                    try:
+                        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        for key in ("command", "query", "url", "name", "path"):
+                            if parsed.get(key) is not None:
+                                preview = str(parsed[key])[:240]
+                                break
+                    public_call_id = call_id
+                    if len(public_call_id) > 255:
+                        digest = hashlib.sha256(public_call_id.encode("utf-8")).hexdigest()[:16]
+                        public_call_id = f"{public_call_id[:238]}:{digest}"
+                    activity = {
+                        "id": public_call_id,
+                        "name": name[:120],
+                        "preview": preview,
+                        "status": "unknown",
+                    }
+                    pending_tools.append(activity)
+                    tools_by_id[call_id] = activity
+
+                added_tools = len(pending_tools) > tool_count_before
+                if added_tools:
+                    pending_scaffold = display_copy(message)
+                if content not in (None, "", []):
+                    if added_tools:
+                        pending_host = display_copy(message)
+                        visible.append(pending_host)
+                        continue
+                    enriched = display_copy(message)
+                    if pending_reasoning:
+                        enriched["reasoning_content"] = pending_reasoning
+                    if pending_tools:
+                        enriched["tool_activity"] = [dict(activity) for activity in pending_tools]
+                    visible.append(enriched)
+                    reset_turn_activity()
+                continue
+
+            if role == "tool":
+                call_id = message.get("tool_call_id")
+                activity = tools_by_id.get(call_id) if isinstance(call_id, str) else None
+                if activity is None:
+                    continue
+                try:
+                    result = json.loads(content) if isinstance(content, str) else content
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    result = content
+                activity["status"] = "failed" if tool_result_failed(result) else "done"
+
+        flush_incomplete_activity()
+        return visible
+
     def get_messages_for_display_page(
         self,
         session_id: str,
@@ -4010,14 +4166,11 @@ class SessionDB:
         cursor therefore stays stable when newer rows are appended while the
         user is scrolling through older history.
         """
-        messages = [
-            message
-            for message in self.get_messages_for_display(
+        messages = self._display_messages_with_activity(
+            self.get_messages_for_display(
                 session_id, include_ancestors=include_ancestors
             )
-            if message.get("role") in {"user", "assistant"}
-            and message.get("content") not in (None, "", [])
-        ]
+        )
         end = len(messages) if before is None else min(before, len(messages))
         start = max(0, end - limit)
         page = messages[start:end]
