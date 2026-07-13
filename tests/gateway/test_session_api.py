@@ -940,15 +940,16 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
 
 @pytest.mark.asyncio
-async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
+async def test_session_chat_stream_accepts_multimodal_message_without_echoing_input(adapter, session_db):
     session_id = session_db.create_session("image-stream-session", "api_server")
+    image_url = "data:image/png;base64," + ("A" * 300_000)
     image_payload = [
         {"type": "input_text", "text": "What's in this image?"},
-        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        {"type": "input_image", "image_url": image_url},
     ]
     expected_user_message = [
         {"type": "text", "text": "What's in this image?"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": image_url}},
     ]
     captured_kwargs = {}
 
@@ -968,7 +969,10 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
             assert resp.headers["Content-Type"].startswith("text/event-stream")
             body = await resp.text()
 
+    assert "event: run.started" in body
     assert "event: assistant.completed" in body
+    assert image_url not in body
+    assert "What's in this image?" not in body
     assert captured_kwargs["user_message"] == expected_user_message
 
 
