@@ -255,7 +255,7 @@ async def test_session_messages_paginate_newest_first_across_compression_lineage
 
 
 @pytest.mark.asyncio
-async def test_session_messages_do_not_let_tool_call_scaffolding_crowd_out_chat_turns(
+async def test_session_messages_collapse_tool_call_scaffolding_into_one_activity_row(
     adapter, session_db
 ):
     session_id = session_db.create_session("paged-tool-run", "api_server")
@@ -293,12 +293,222 @@ async def test_session_messages_do_not_let_tool_call_scaffolding_crowd_out_chat_
         page = await response.json()
 
     assert [(message["role"], message["content"]) for message in page["data"]] == [
-        ("user", "previous request"),
         ("assistant", "previous reply"),
         ("user", "current request"),
+        ("assistant", ""),
     ]
-    assert page["has_more"] is False
-    assert page["next_cursor"] is None
+    assert len(page["data"][-1]["tool_activity"]) == 8
+    assert all(activity["status"] == "done" for activity in page["data"][-1]["tool_activity"])
+    assert page["has_more"] is True
+    assert isinstance(page["next_cursor"], str)
+
+
+@pytest.mark.asyncio
+async def test_session_messages_attach_durable_tool_and_reasoning_activity_to_reply(
+    adapter, session_db
+):
+    session_id = session_db.create_session("paged-durable-activity", "api_server")
+    session_db.append_message(session_id, "user", "Run the checks")
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "I'll run the focused suite.",
+        reasoning="I should verify the focused suite first.",
+        tool_calls=[{
+            "id": "call-checks",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "pytest tests/api -q"}),
+            },
+        }],
+    )
+    session_db.append_message(
+        session_id,
+        "tool",
+        json.dumps({"output": "12 passed", "exit_code": 0}),
+        tool_call_id="call-checks",
+        tool_name="terminal",
+    )
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "All checks passed.",
+        reasoning_content="The focused suite is green.",
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages?limit=3")
+        assert response.status == 200
+        page = await response.json()
+
+    assert [(message["role"], message["content"]) for message in page["data"]] == [
+        ("user", "Run the checks"),
+        ("assistant", "I'll run the focused suite."),
+        ("assistant", "All checks passed."),
+    ]
+    reply = page["data"][2]
+    assert "tool_calls" not in page["data"][1]
+    assert "reasoning" not in page["data"][1]
+    assert "reasoning_content" not in page["data"][1]
+    assert reply["reasoning_content"] == (
+        "I should verify the focused suite first.\n\nThe focused suite is green."
+    )
+    assert reply["tool_activity"] == [{
+        "id": "call-checks",
+        "name": "terminal",
+        "preview": "pytest tests/api -q",
+        "status": "done",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_handle_malformed_calls_and_failed_tools_consistently(
+    adapter, session_db
+):
+    session_id = session_db.create_session("paged-durable-failure", "api_server")
+    session_db.append_message(session_id, "user", "Try both operations")
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "Malformed metadata stays visible.",
+        tool_calls=42,
+    )
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "",
+        tool_calls=[{
+            "id": "call-failed",
+            "type": "function",
+            "function": {
+                "name": "browser",
+                "arguments": json.dumps({"url": "https://example.invalid"}),
+            },
+        }, {
+            "id": "call-timeout",
+            "type": "function",
+            "function": {
+                "name": "process",
+                "arguments": json.dumps({"name": "slow-job"}),
+            },
+        }, {
+            "id": "call-cancelled",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "long-job"}),
+            },
+        }],
+    )
+    session_db.append_message(
+        session_id,
+        "tool",
+        json.dumps({"success": False, "message": "denied"}),
+        tool_call_id="call-failed",
+        tool_name="browser",
+    )
+    session_db.append_message(
+        session_id,
+        "tool",
+        json.dumps({"status": "timeout", "message": "deadline exceeded"}),
+        tool_call_id="call-timeout",
+        tool_name="process",
+    )
+    session_db.append_message(
+        session_id,
+        "tool",
+        "[Tool execution cancelled by user]",
+        tool_call_id="call-cancelled",
+        tool_name="terminal",
+    )
+    session_db.append_message(session_id, "assistant", "The browser operation failed.")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        paged_response = await cli.get(f"/api/sessions/{session_id}/messages?limit=3")
+        assert paged_response.status == 200
+        paged = await paged_response.json()
+
+    expected_content = [
+        "Try both operations",
+        "Malformed metadata stays visible.",
+        "The browser operation failed.",
+    ]
+    assert [message["content"] for message in paged["data"]] == expected_content
+    assert paged["data"][-1]["tool_activity"] == [{
+        "id": "call-failed",
+        "name": "browser",
+        "preview": "https://example.invalid",
+        "status": "failed",
+    }, {
+        "id": "call-timeout",
+        "name": "process",
+        "preview": "slow-job",
+        "status": "failed",
+    }, {
+        "id": "call-cancelled",
+        "name": "terminal",
+        "preview": "long-job",
+        "status": "failed",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_expose_incomplete_cancelled_tool_turn(
+    adapter, session_db
+):
+    session_id = session_db.create_session("paged-incomplete-tool", "api_server")
+    call_id = "call-" + ("x" * 300)
+    session_db.append_message(session_id, "user", "Start the long job")
+    session_db.append_message(
+        session_id,
+        "assistant",
+        "",
+        reasoning="Legacy reasoning segment.",
+        reasoning_content="Modern reasoning segment.",
+        tool_calls=[{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "long-job"}),
+            },
+        }],
+    )
+    session_db.append_message(
+        session_id,
+        "tool",
+        "[Tool execution cancelled by user]",
+        tool_call_id=call_id,
+        tool_name="terminal",
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages?limit=2")
+        assert response.status == 200
+        page = await response.json()
+
+    assert [(message["role"], message["content"]) for message in page["data"]] == [
+        ("user", "Start the long job"),
+        ("assistant", ""),
+    ]
+    incomplete = page["data"][-1]
+    assert "tool_calls" not in incomplete
+    assert "reasoning" not in incomplete
+    assert incomplete["reasoning_content"] == (
+        "Modern reasoning segment.\n\nLegacy reasoning segment."
+    )
+    assert len(incomplete["tool_activity"]) == 1
+    activity = incomplete["tool_activity"][0]
+    assert len(activity["id"]) == 255
+    assert activity["id"].startswith("call-")
+    assert activity["id"] != call_id
+    assert activity["name"] == "terminal"
+    assert activity["preview"] == "long-job"
+    assert activity["status"] == "failed"
 
 
 @pytest.mark.asyncio
