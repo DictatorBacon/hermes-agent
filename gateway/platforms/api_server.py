@@ -1975,7 +1975,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await session_lock.acquire()
                 acquired = True
                 session_id = db.get_compression_tip(session_id) or session_id
-                await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+                await queue.put(_event_payload("run.started", {}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = self._conversation_history_for_session(session_id)
                 display_before = None
