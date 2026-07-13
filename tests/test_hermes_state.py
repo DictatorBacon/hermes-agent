@@ -1222,6 +1222,37 @@ class TestFTS5Search:
         roles = [r["role"] for r in results]
         assert all(r == "assistant" for r in roles)
 
+    def test_search_session_id_filter_never_returns_foreign_sessions(self, db):
+        db.create_session(session_id="allowed", source="api_server")
+        db.create_session(session_id="foreign", source="api_server")
+        db.append_message("allowed", role="user", content="shared transcript needle")
+        db.append_message("foreign", role="user", content="shared transcript needle")
+
+        results = db.search_messages("needle", session_id_filter=["allowed"])
+
+        assert {result["session_id"] for result in results} == {"allowed"}
+        assert db.search_messages("needle", session_id_filter=[]) == []
+
+    def test_search_session_id_filter_scopes_short_cjk_fallback(self, db):
+        db.create_session(session_id="allowed-cjk", source="api_server")
+        db.create_session(session_id="foreign-cjk", source="api_server")
+        db.append_message("allowed-cjk", role="user", content="广西续保项目")
+        db.append_message("foreign-cjk", role="user", content="广西机密项目")
+
+        results = db.search_messages("广西", session_id_filter=["allowed-cjk"])
+
+        assert {result["session_id"] for result in results} == {"allowed-cjk"}
+
+    def test_search_can_skip_surrounding_context(self, db):
+        db.create_session(session_id="s1", source="api_server")
+        db.append_message("s1", role="user", content="before needle")
+        db.append_message("s1", role="assistant", content="needle match")
+
+        results = db.search_messages("needle", include_context=False)
+
+        assert results
+        assert all("context" not in result for result in results)
+
     def test_search_returns_context(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Tell me about Kubernetes")

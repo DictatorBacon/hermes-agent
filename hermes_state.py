@@ -4561,6 +4561,8 @@ class SessionDB:
         offset: int = 0,
         sort: str = None,
         include_inactive: bool = False,
+        session_id_filter: List[str] = None,
+        include_context: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -4596,6 +4598,16 @@ class SessionDB:
         if not query or not query.strip():
             return []
 
+        session_filter_json = None
+        if session_id_filter is not None:
+            session_ids = list(dict.fromkeys(
+                session_id for session_id in session_id_filter
+                if isinstance(session_id, str) and session_id
+            ))
+            if not session_ids:
+                return []
+            session_filter_json = json.dumps(session_ids)
+
         query = self._sanitize_fts5_query(query)
         if not query:
             return []
@@ -4627,6 +4639,10 @@ class SessionDB:
             # are discoverable; only rewind/undo rows (active=0, compacted=0)
             # are hidden. See archive_and_compact() / #38763.
             where_clauses.append("(m.active = 1 OR m.compacted = 1)")
+
+        if session_filter_json is not None:
+            where_clauses.append("m.session_id IN (SELECT value FROM json_each(?))")
+            params.append(session_filter_json)
 
         if source_filter is not None:
             source_placeholders = ",".join("?" for _ in source_filter)
@@ -4709,6 +4725,9 @@ class SessionDB:
                 tri_params: list = [trigram_query]
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
+                if session_filter_json is not None:
+                    tri_where.append("m.session_id IN (SELECT value FROM json_each(?))")
+                    tri_params.append(session_filter_json)
                 if source_filter is not None:
                     tri_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     tri_params.extend(source_filter)
@@ -4766,6 +4785,9 @@ class SessionDB:
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
                 like_where = [f"({' OR '.join(token_clauses)})"]
+                if session_filter_json is not None:
+                    like_where.append("m.session_id IN (SELECT value FROM json_each(?))")
+                    like_params.append(session_filter_json)
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
@@ -4803,6 +4825,11 @@ class SessionDB:
                     return []
                 else:
                     matches = [dict(row) for row in cursor.fetchall()]
+
+        if not include_context:
+            for match in matches:
+                match.pop("content", None)
+            return matches
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.

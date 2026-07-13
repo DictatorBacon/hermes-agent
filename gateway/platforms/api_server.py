@@ -860,6 +860,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # the same resolved tip so concurrent browser tabs cannot interleave rows or
         # contaminate each other's completion transcript.
         self._session_chat_locks: Dict[str, asyncio.Lock] = {}
+        # Transcript searches use SQLite synchronously. Keep them off the event
+        # loop and cap concurrent scans so a burst of browser searches cannot
+        # monopolize the gateway process.
+        self._session_search_semaphore = asyncio.Semaphore(2)
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1616,6 +1620,128 @@ class APIServerAdapter(BasePlatformAdapter):
             "offset": offset,
             "has_more": len(sessions) == limit,
         })
+
+    async def _handle_search_sessions(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/search, search only an explicit session allowlist."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        unknown = sorted(set(body) - {"query", "session_ids", "limit"})
+        if unknown:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported search fields: {', '.join(unknown)}",
+                    code="unsupported_search_field",
+                ),
+                status=400,
+            )
+        raw_query = body.get("query")
+        query = " ".join(raw_query.split()) if isinstance(raw_query, str) else ""
+        if not query or len(query) > 200:
+            return web.json_response(
+                _openai_error(
+                    "query must contain between 1 and 200 characters",
+                    code="invalid_search_query",
+                ),
+                status=400,
+            )
+        raw_session_ids = body.get("session_ids")
+        if not isinstance(raw_session_ids, list) or len(raw_session_ids) > 5_000:
+            return web.json_response(
+                _openai_error(
+                    "session_ids must be an array with at most 5000 entries",
+                    code="invalid_session_ids",
+                ),
+                status=400,
+            )
+        from gateway.session import _is_path_unsafe
+        session_ids: List[str] = []
+        for raw_session_id in raw_session_ids:
+            if (
+                not isinstance(raw_session_id, str)
+                or not raw_session_id
+                or len(raw_session_id) > self._MAX_SESSION_HEADER_LEN
+                or re.search(r'[\r\n\x00]', raw_session_id)
+                or _is_path_unsafe(raw_session_id)
+            ):
+                return web.json_response(
+                    _openai_error("Invalid session ID in session_ids", code="invalid_session_ids"),
+                    status=400,
+                )
+            if raw_session_id not in session_ids:
+                session_ids.append(raw_session_id)
+        raw_limit = body.get("limit", 100)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or not 1 <= raw_limit <= 100:
+            return web.json_response(
+                _openai_error("limit must be an integer between 1 and 100", code="invalid_search_limit"),
+                status=400,
+            )
+        if not session_ids:
+            return web.json_response({"object": "list", "data": [], "truncated": False})
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        if not getattr(db, "_fts_enabled", False):
+            return web.json_response(
+                _openai_error("Session search unavailable", code="session_search_unavailable"),
+                status=503,
+            )
+
+        def search() -> tuple[List[Dict[str, Any]], bool]:
+            allowed = set(session_ids)
+            found: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            offset = 0
+            scanned = 0
+            scan_cap = 5_000
+            page_size = 250
+            exhausted = False
+            while scanned < scan_cap and len(found) < raw_limit:
+                batch_size = min(page_size, scan_cap - scanned)
+                matches = db.search_messages(
+                    query,
+                    role_filter=["user", "assistant"],
+                    limit=batch_size,
+                    offset=offset,
+                    include_inactive=False,
+                    session_id_filter=session_ids,
+                    include_context=False,
+                )
+                scanned += len(matches)
+                offset += len(matches)
+                if len(matches) < batch_size:
+                    exhausted = True
+                for match in matches:
+                    matched_id = str(match.get("session_id") or "")
+                    if matched_id not in allowed:
+                        continue
+                    resolved_id = db.get_compression_tip(matched_id) or matched_id
+                    if resolved_id not in allowed:
+                        resolved_id = matched_id
+                    if resolved_id in seen:
+                        continue
+                    session = db.get_session(resolved_id)
+                    if not session:
+                        continue
+                    seen.add(resolved_id)
+                    found.append(self._session_response(session))
+                    if len(found) >= raw_limit:
+                        break
+                if exhausted or not matches:
+                    break
+            return found, len(found) >= raw_limit or not exhausted
+
+        async with self._session_search_semaphore:
+            sessions, truncated = await asyncio.to_thread(search)
+        return web.json_response({"object": "list", "data": sessions, "truncated": truncated})
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions — create an empty Hermes session row."""
@@ -4889,6 +5015,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
+            self._app.router.add_post("/api/sessions/search", self._handle_search_sessions)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)
             self._app.router.add_patch("/api/sessions/{session_id}", self._handle_patch_session)
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
