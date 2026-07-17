@@ -976,6 +976,24 @@ async def test_session_chat_stream_cancellation_holds_lineage_lock_until_agent_s
     assert calls == [first_tip, second_tip]
 
 
+def test_session_turn_lock_fails_closed_when_lineage_lookup_fails(
+    adapter, session_db
+):
+    root_id = session_db.create_session("fail-closed-root", "api_server")
+    session_db.end_session(root_id, "compression")
+    tip_id = session_db.create_session(
+        "fail-closed-tip", "api_server", parent_session_id=root_id
+    )
+
+    with patch.object(
+        session_db,
+        "get_compression_lineage",
+        side_effect=RuntimeError("state DB unavailable"),
+    ):
+        with pytest.raises(RuntimeError, match="state DB unavailable"):
+            adapter._session_turn_lock(tip_id)
+
+
 @pytest.mark.asyncio
 async def test_session_endpoints_require_auth_when_key_configured(auth_adapter):
     app = _create_session_app(auth_adapter)

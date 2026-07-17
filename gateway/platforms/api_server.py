@@ -1000,6 +1000,10 @@ except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
 
 
+class _SessionContinuityUnavailable(RuntimeError):
+    """The state store could not safely resolve a session lineage."""
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -2534,18 +2538,20 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_key = session_id
         try:
             db = self._ensure_session_db()
+            if db is None:
+                raise RuntimeError("state DB unavailable")
             lineage = db.get_compression_lineage(session_id)
-            if (
-                isinstance(lineage, list)
-                and lineage
-                and isinstance(lineage[0], str)
-                and lineage[0]
-            ):
-                lock_key = lineage[0]
-        except Exception:
-            # Continuity remains available in degraded DB scenarios, keyed by
-            # the caller's session ID until the state store recovers.
-            pass
+        except Exception as exc:
+            raise _SessionContinuityUnavailable(
+                f"Session continuity state is unavailable: {exc}"
+            ) from exc
+        if (
+            isinstance(lineage, list)
+            and lineage
+            and isinstance(lineage[0], str)
+            and lineage[0]
+        ):
+            lock_key = lineage[0]
         lock = self._session_turn_locks.get(lock_key)
         if lock is None:
             # Request handlers share one event loop, and there is no await
@@ -2566,16 +2572,29 @@ class APIServerAdapter(BasePlatformAdapter):
         resolved_history = history
         try:
             db = self._ensure_session_db()
+            if db is None:
+                raise RuntimeError("state DB unavailable")
             candidate = db.resolve_resume_session_id(session_id)
             if isinstance(candidate, str) and candidate:
                 resolved_session_id = candidate
             if load_persisted_history:
                 resolved_history = db.get_messages_as_conversation(resolved_session_id)
         except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            if load_persisted_history:
-                resolved_history = []
+            raise _SessionContinuityUnavailable(
+                f"Session continuity state is unavailable: {exc}"
+            ) from exc
         return resolved_session_id, resolved_history
+
+    @staticmethod
+    def _session_continuity_unavailable_response() -> "web.Response":
+        return web.json_response(
+            _openai_error(
+                "Session continuity state is temporarily unavailable; retry shortly.",
+                code="session_state_unavailable",
+            ),
+            status=503,
+            headers={"Retry-After": "1"},
+        )
 
     async def _run_session_agent_cancellation_safe(self, **kwargs):
         """Keep executor-backed agent work owned until it reaches a terminal state.
@@ -2631,7 +2650,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if runtime_err is not None:
             return runtime_err
-        turn_lock = self._session_turn_lock(session_id)
+        try:
+            turn_lock = self._session_turn_lock(session_id)
+        except _SessionContinuityUnavailable:
+            return self._session_continuity_unavailable_response()
         async with turn_lock:
             db = self._ensure_session_db()
             session_id = db.resolve_resume_session_id(session_id)
@@ -2689,7 +2711,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_err is not None:
             return runtime_err
 
-        turn_lock = self._session_turn_lock(session_id)
+        try:
+            turn_lock = self._session_turn_lock(session_id)
+        except _SessionContinuityUnavailable:
+            return self._session_continuity_unavailable_response()
         requested_session_id = session_id
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -3019,7 +3044,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
-            turn_lock = self._session_turn_lock(session_id)
+            try:
+                turn_lock = self._session_turn_lock(session_id)
+            except _SessionContinuityUnavailable:
+                return self._session_continuity_unavailable_response()
             await turn_lock.acquire()
             try:
                 turn_session_id, turn_history = self._resolve_session_turn_context(
@@ -3046,6 +3074,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         turn_lock.release()
 
                 agent_task = asyncio.ensure_future(_run_locked_stream_turn())
+            except _SessionContinuityUnavailable:
+                if turn_lock.locked():
+                    turn_lock.release()
+                return self._session_continuity_unavailable_response()
             except BaseException:
                 if turn_lock.locked():
                     turn_lock.release()
@@ -3086,6 +3118,8 @@ class APIServerAdapter(BasePlatformAdapter):
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except _SessionContinuityUnavailable:
+                return self._session_continuity_unavailable_response()
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -3095,6 +3129,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except _SessionContinuityUnavailable:
+                return self._session_continuity_unavailable_response()
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(

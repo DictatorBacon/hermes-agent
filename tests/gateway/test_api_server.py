@@ -3831,27 +3831,24 @@ class TestSessionIdHeader:
             assert call_kwargs["user_message"] == "new question"
 
     @pytest.mark.asyncio
-    async def test_db_failure_falls_back_to_empty_history(self, auth_adapter):
-        """If SessionDB raises, history falls back to empty and request still succeeds."""
-        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
-        # Simulate DB failure: _session_db is None and SessionDB() constructor raises
+    async def test_db_failure_fails_closed_before_running_agent(self, auth_adapter):
+        """If session state is unavailable, reject rather than run without continuity."""
         auth_adapter._session_db = None
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
                  patch("hermes_state.SessionDB", side_effect=Exception("DB unavailable")):
-                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-
                 resp = await cli.post(
                     "/v1/chat/completions",
                     headers={"X-Hermes-Session-Id": "some-session", "Authorization": "Bearer sk-secret"},
                     json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
                 )
 
-            assert resp.status == 200
-            call_kwargs = mock_run.call_args.kwargs
-            assert call_kwargs["conversation_history"] == []
-            assert call_kwargs["session_id"] == "some-session"
+            assert resp.status == 503
+            data = await resp.json()
+            assert data["error"]["code"] == "session_state_unavailable"
+            assert resp.headers["Retry-After"] == "1"
+            mock_run.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
