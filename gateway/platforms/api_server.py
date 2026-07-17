@@ -2542,6 +2542,33 @@ class APIServerAdapter(BasePlatformAdapter):
             self._session_turn_locks[lock_key] = lock
         return lock
 
+    async def _run_session_agent_cancellation_safe(self, **kwargs):
+        """Keep executor-backed agent work owned until it reaches a terminal state.
+
+        Cancelling an asyncio task that awaits ``run_in_executor`` does not stop
+        the worker thread. Drain the inner task before unwinding so callers keep
+        the compression-lineage lock until persistence and rotation are done.
+        """
+        agent_task = asyncio.create_task(self._run_agent(**kwargs))
+        try:
+            return await asyncio.shield(agent_task)
+        except asyncio.CancelledError:
+            while not agent_task.done():
+                try:
+                    await asyncio.shield(agent_task)
+                except asyncio.CancelledError:
+                    if agent_task.done():
+                        break
+                    continue
+                except Exception:
+                    break
+            if agent_task.done() and not agent_task.cancelled():
+                try:
+                    agent_task.exception()
+                except Exception:
+                    pass
+            raise
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -2574,7 +2601,7 @@ class APIServerAdapter(BasePlatformAdapter):
             db = self._ensure_session_db()
             session_id = db.resolve_resume_session_id(session_id)
             history = self._conversation_history_for_session(session_id)
-            result, usage = await self._run_agent(
+            result, usage = await self._run_session_agent_cancellation_safe(
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
@@ -2680,7 +2707,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                     await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                     history = self._conversation_history_for_session(turn_session_id)
-                    result, usage = await self._run_agent(
+                    result, usage = await self._run_session_agent_cancellation_safe(
                         user_message=user_message,
                         conversation_history=history,
                         ephemeral_system_prompt=system_prompt,
