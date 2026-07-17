@@ -2531,9 +2531,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _session_turn_lock(self, session_id: str) -> "asyncio.Lock":
         """Return the in-process turn lock for a compression lineage."""
-        db = self._ensure_session_db()
-        lineage = db.get_compression_lineage(session_id)
-        lock_key = lineage[0] if lineage else session_id
+        lock_key = session_id
+        try:
+            db = self._ensure_session_db()
+            lineage = db.get_compression_lineage(session_id)
+            if (
+                isinstance(lineage, list)
+                and lineage
+                and isinstance(lineage[0], str)
+                and lineage[0]
+            ):
+                lock_key = lineage[0]
+        except Exception:
+            # Continuity remains available in degraded DB scenarios, keyed by
+            # the caller's session ID until the state store recovers.
+            pass
         lock = self._session_turn_locks.get(lock_key)
         if lock is None:
             # Request handlers share one event loop, and there is no await
@@ -2541,6 +2553,29 @@ class APIServerAdapter(BasePlatformAdapter):
             lock = asyncio.Lock()
             self._session_turn_locks[lock_key] = lock
         return lock
+
+    def _resolve_session_turn_context(
+        self,
+        session_id: str,
+        history: List[Dict[str, Any]],
+        *,
+        load_persisted_history: bool,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """Resolve a physical compression tip and its authoritative history."""
+        resolved_session_id = session_id
+        resolved_history = history
+        try:
+            db = self._ensure_session_db()
+            candidate = db.resolve_resume_session_id(session_id)
+            if isinstance(candidate, str) and candidate:
+                resolved_session_id = candidate
+            if load_persisted_history:
+                resolved_history = db.get_messages_as_conversation(resolved_session_id)
+        except Exception as exc:
+            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            if load_persisted_history:
+                resolved_history = []
+        return resolved_session_id, resolved_history
 
     async def _run_session_agent_cancellation_safe(self, **kwargs):
         """Keep executor-backed agent work owned until it reaches a terminal state.
@@ -2890,13 +2925,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = self._ensure_session_db()
-                if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -2991,38 +3019,67 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
-            agent_task = asyncio.ensure_future(self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                stream_delta_callback=_on_delta,
-                tool_start_callback=_on_tool_start,
-                tool_complete_callback=_on_tool_complete,
-                agent_ref=agent_ref,
-                gateway_session_key=gateway_session_key,
-                route=route,
-            ))
+            turn_lock = self._session_turn_lock(session_id)
+            await turn_lock.acquire()
+            try:
+                turn_session_id, turn_history = self._resolve_session_turn_context(
+                    session_id,
+                    history,
+                    load_persisted_history=bool(provided_session_id),
+                )
+
+                async def _run_locked_stream_turn():
+                    try:
+                        return await self._run_session_agent_cancellation_safe(
+                            user_message=user_message,
+                            conversation_history=turn_history,
+                            ephemeral_system_prompt=system_prompt,
+                            session_id=turn_session_id,
+                            stream_delta_callback=_on_delta,
+                            tool_start_callback=_on_tool_start,
+                            tool_complete_callback=_on_tool_complete,
+                            agent_ref=agent_ref,
+                            gateway_session_key=gateway_session_key,
+                            route=route,
+                        )
+                    finally:
+                        turn_lock.release()
+
+                agent_task = asyncio.ensure_future(_run_locked_stream_turn())
+            except BaseException:
+                if turn_lock.locked():
+                    turn_lock.release()
+                raise
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
+                agent_task, agent_ref, session_id=turn_session_id,
                 gateway_session_key=gateway_session_key,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-                route=route,
-            )
+            turn_lock = self._session_turn_lock(session_id)
+            async with turn_lock:
+                turn_session_id, turn_history = self._resolve_session_turn_context(
+                    session_id,
+                    history,
+                    load_persisted_history=bool(provided_session_id),
+                )
+                result, usage = await self._run_session_agent_cancellation_safe(
+                    user_message=user_message,
+                    conversation_history=turn_history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=turn_session_id,
+                    gateway_session_key=gateway_session_key,
+                    route=route,
+                )
+                if isinstance(result, dict) and not result.get("session_id"):
+                    result = {**result, "session_id": turn_session_id}
+                return result, usage
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
