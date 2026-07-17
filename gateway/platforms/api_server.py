@@ -2533,6 +2533,8 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        db = self._ensure_session_db()
+        session_id = db.resolve_resume_session_id(session_id)
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2586,6 +2588,8 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        db = self._ensure_session_db()
+        session_id = db.resolve_resume_session_id(session_id)
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2609,11 +2613,12 @@ class APIServerAdapter(BasePlatformAdapter):
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
+        effective_session_id = session_id
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
             seq += 1
-            payload.setdefault("session_id", session_id)
+            payload.setdefault("session_id", effective_session_id)
             payload.setdefault("run_id", run_id)
             payload.setdefault("seq", seq)
             payload.setdefault("ts", time.time())
@@ -2645,6 +2650,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         async def _run_and_signal() -> None:
+            nonlocal effective_session_id
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
@@ -4540,6 +4546,24 @@ class APIServerAdapter(BasePlatformAdapter):
             return len(expected_prefix)
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
+        # Rotation-based compaction rewrites the transcript prefix around a
+        # synthetic handoff summary. The latest matching user message remains
+        # the authoritative start of this turn.
+        for index in range(len(agent_messages) - 1, -1, -1):
+            message = agent_messages[index]
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and message.get("content") == user_message
+            ):
+                return index + 1
+        # A synthetic continuity/TODO user row can follow the original request.
+        # It is still a safer boundary than copying every historical tool result
+        # into a terminal SSE event.
+        for index in range(len(agent_messages) - 1, -1, -1):
+            message = agent_messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                return index + 1
         return 0
 
     @classmethod

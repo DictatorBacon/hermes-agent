@@ -707,6 +707,141 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     assert any(m.get("tool_calls") for m in messages)
 
 
+@pytest.mark.asyncio
+async def test_session_chat_stream_rotation_emits_only_current_turn(adapter, session_db):
+    """A rotating compaction must not copy the compacted transcript into SSE.
+
+    The pre-turn history and the post-compaction transcript intentionally have
+    different prefixes.  Returning every assistant/tool row in run.completed
+    can exceed the WebUI event budget and makes a completed turn look broken.
+    """
+    import json as _json
+
+    parent_id = session_db.create_session("rotation-parent", "api_server")
+    session_db.append_message(parent_id, "user", "older request")
+    session_db.append_message(parent_id, "assistant", "older answer " + ("x" * 10_000))
+    child_id = "rotation-child"
+
+    async def fake_run(**kwargs):
+        session_db.end_session(parent_id, "compression")
+        session_db.create_session(child_id, "api_server", parent_session_id=parent_id)
+        kwargs["stream_delta_callback"]("Current plan")
+        kwargs["stream_delta_callback"]("Current answer")
+        return {
+            "final_response": "Current answer",
+            "session_id": child_id,
+            "messages": [
+                {"role": "user", "content": "[CONTEXT COMPACTION] internal handoff"},
+                {"role": "assistant", "content": "older answer " + ("x" * 10_000)},
+                {"role": "user", "content": "continue after compaction"},
+                {
+                    "role": "assistant",
+                    "content": "Current plan",
+                    "tool_calls": [{
+                        "id": "call_current",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "content": "current result",
+                    "tool_call_id": "call_current",
+                    "tool_name": "terminal",
+                },
+                {"role": "assistant", "content": "Current answer"},
+            ],
+        }, {"total_tokens": 7}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{parent_id}/chat/stream",
+                json={"message": "continue after compaction"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    payloads = {}
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        event_name = next((line[7:] for line in lines if line.startswith("event: ")), None)
+        data_line = next((line[6:] for line in lines if line.startswith("data: ")), None)
+        if event_name and data_line:
+            payloads[event_name] = _json.loads(data_line)
+
+    completed = payloads["run.completed"]
+    assert completed["session_id"] == child_id
+    assert [message.get("content") for message in completed["messages"]] == [
+        "Current plan",
+        "current result",
+        "Current answer",
+    ]
+    assert payloads["done"]["session_id"] == child_id
+    assert "older answer" not in _json.dumps(completed)
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_resolves_stale_compression_root(adapter, session_db):
+    root_id = session_db.create_session("stale-stream-root", "api_server")
+    session_db.append_message(root_id, "user", "root turn")
+    session_db.end_session(root_id, "compression")
+    tip_id = session_db.create_session(
+        "stale-stream-tip", "api_server", parent_session_id=root_id
+    )
+    session_db.append_message(tip_id, "assistant", "tip answer")
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        kwargs["stream_delta_callback"]("continued")
+        return {"final_response": "continued", "session_id": tip_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{root_id}/chat/stream",
+                json={"message": "continue"},
+            )
+            assert resp.status == 200
+            await resp.text()
+
+    assert captured["session_id"] == tip_id
+    assert [message["content"] for message in captured["conversation_history"]] == [
+        "tip answer"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_resolves_stale_compression_root(adapter, session_db):
+    root_id = session_db.create_session("stale-chat-root", "api_server")
+    session_db.append_message(root_id, "user", "root turn")
+    session_db.end_session(root_id, "compression")
+    tip_id = session_db.create_session(
+        "stale-chat-tip", "api_server", parent_session_id=root_id
+    )
+    session_db.append_message(tip_id, "assistant", "tip answer")
+    mock_run = AsyncMock(
+        return_value=({"final_response": "continued", "session_id": tip_id}, {"total_tokens": 1})
+    )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{root_id}/chat",
+                json={"message": "continue"},
+            )
+            assert resp.status == 200
+
+    assert mock_run.call_args.kwargs["session_id"] == tip_id
+    assert [
+        message["content"]
+        for message in mock_run.call_args.kwargs["conversation_history"]
+    ] == ["tip answer"]
+
 
 @pytest.mark.asyncio
 async def test_session_endpoints_require_auth_when_key_configured(auth_adapter):
