@@ -844,6 +844,67 @@ async def test_session_chat_resolves_stale_compression_root(adapter, session_db)
 
 
 @pytest.mark.asyncio
+async def test_session_chat_turns_serialize_on_compression_lineage(adapter, session_db):
+    """Queued stale-root turns must re-resolve after a predecessor rotates."""
+    import asyncio
+
+    root_id = session_db.create_session("locked-root", "api_server")
+    session_db.end_session(root_id, "compression")
+    first_tip = session_db.create_session(
+        "locked-tip-one", "api_server", parent_session_id=root_id
+    )
+    session_db.append_message(first_tip, "assistant", "first tip history")
+    second_tip = "locked-tip-two"
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = []
+
+    async def fake_run(**kwargs):
+        calls.append(kwargs["session_id"])
+        if len(calls) == 1:
+            first_started.set()
+            await release_first.wait()
+            session_db.end_session(first_tip, "compression")
+            session_db.create_session(
+                second_tip, "api_server", parent_session_id=first_tip
+            )
+            session_db.append_message(second_tip, "assistant", "second tip history")
+            return {
+                "final_response": "first completed",
+                "session_id": second_tip,
+            }, {"total_tokens": 1}
+        return {
+            "final_response": "second completed",
+            "session_id": second_tip,
+        }, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first_response = await cli.post(
+                f"/api/sessions/{root_id}/chat/stream",
+                json={"message": "first request"},
+            )
+            await first_started.wait()
+            second_request = asyncio.create_task(cli.post(
+                f"/api/sessions/{root_id}/chat",
+                json={"message": "second request"},
+            ))
+            await asyncio.sleep(0.05)
+            try:
+                assert calls == [first_tip], (
+                    "second turn entered before the lineage lock released"
+                )
+            finally:
+                release_first.set()
+            await first_response.text()
+            second_response = await second_request
+            assert second_response.status == 200
+
+    assert calls == [first_tip, second_tip]
+
+
+@pytest.mark.asyncio
 async def test_session_endpoints_require_auth_when_key_configured(auth_adapter):
     app = _create_session_app(auth_adapter)
     async with TestClient(TestServer(app)) as cli:

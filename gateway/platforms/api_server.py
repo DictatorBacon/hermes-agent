@@ -54,6 +54,7 @@ import sqlite3
 import sys
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1070,6 +1071,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Serialize user turns on the stable compression-lineage root. Weak
+        # values avoid retaining one lock forever for every historical chat.
+        self._session_turn_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+            weakref.WeakValueDictionary()
+        )
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2523,6 +2529,19 @@ class APIServerAdapter(BasePlatformAdapter):
         fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
+    def _session_turn_lock(self, session_id: str) -> "asyncio.Lock":
+        """Return the in-process turn lock for a compression lineage."""
+        db = self._ensure_session_db()
+        lineage = db.get_compression_lineage(session_id)
+        lock_key = lineage[0] if lineage else session_id
+        lock = self._session_turn_locks.get(lock_key)
+        if lock is None:
+            # Request handlers share one event loop, and there is no await
+            # between lookup and insertion, so this creation is atomic here.
+            lock = asyncio.Lock()
+            self._session_turn_locks[lock_key] = lock
+        return lock
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -2533,8 +2552,6 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
-        db = self._ensure_session_db()
-        session_id = db.resolve_resume_session_id(session_id)
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2552,17 +2569,21 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if runtime_err is not None:
             return runtime_err
-        history = self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-            request_route=request_route,
-            reasoning_effort_override=reasoning_effort_override,
-            service_tier_override=service_tier_override,
-        )
+        turn_lock = self._session_turn_lock(session_id)
+        async with turn_lock:
+            db = self._ensure_session_db()
+            session_id = db.resolve_resume_session_id(session_id)
+            history = self._conversation_history_for_session(session_id)
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                request_route=request_route,
+                reasoning_effort_override=reasoning_effort_override,
+                service_tier_override=service_tier_override,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -2588,8 +2609,6 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
-        db = self._ensure_session_db()
-        session_id = db.resolve_resume_session_id(session_id)
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2608,6 +2627,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_err is not None:
             return runtime_err
 
+        turn_lock = self._session_turn_lock(session_id)
+        requested_session_id = session_id
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -2652,39 +2673,43 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_signal() -> None:
             nonlocal effective_session_id
             try:
-                await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
-                await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    user_message=user_message,
-                    conversation_history=history,
-                    ephemeral_system_prompt=system_prompt,
-                    session_id=session_id,
-                    stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress,
-                    gateway_session_key=gateway_session_key,
-                    request_route=request_route,
-                    reasoning_effort_override=reasoning_effort_override,
-                    service_tier_override=service_tier_override,
-                )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
-                effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
-                await queue.put(_event_payload("assistant.completed", {
-                    "session_id": effective_session_id,
-                    "message_id": message_id,
-                    "content": final_response,
-                    "completed": True,
-                    "partial": False,
-                    "interrupted": False,
-                }))
-                await queue.put(_event_payload("run.completed", {
-                    "session_id": effective_session_id,
-                    "message_id": message_id,
-                    "completed": True,
-                    "messages": turn_messages,
-                    "usage": usage,
-                }))
+                async with turn_lock:
+                    db = self._ensure_session_db()
+                    turn_session_id = db.resolve_resume_session_id(requested_session_id)
+                    effective_session_id = turn_session_id
+                    await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+                    await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+                    history = self._conversation_history_for_session(turn_session_id)
+                    result, usage = await self._run_agent(
+                        user_message=user_message,
+                        conversation_history=history,
+                        ephemeral_system_prompt=system_prompt,
+                        session_id=turn_session_id,
+                        stream_delta_callback=_delta,
+                        tool_progress_callback=_tool_progress,
+                        gateway_session_key=gateway_session_key,
+                        request_route=request_route,
+                        reasoning_effort_override=reasoning_effort_override,
+                        service_tier_override=service_tier_override,
+                    )
+                    final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                    effective_session_id = result.get("session_id", turn_session_id) if isinstance(result, dict) else turn_session_id
+                    turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                    await queue.put(_event_payload("assistant.completed", {
+                        "session_id": effective_session_id,
+                        "message_id": message_id,
+                        "content": final_response,
+                        "completed": True,
+                        "partial": False,
+                        "interrupted": False,
+                    }))
+                    await queue.put(_event_payload("run.completed", {
+                        "session_id": effective_session_id,
+                        "message_id": message_id,
+                        "completed": True,
+                        "messages": turn_messages,
+                        "usage": usage,
+                    }))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
