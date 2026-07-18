@@ -1567,6 +1567,28 @@ class TestFTS5Search:
         assert {result["session_id"] for result in results} == {"allowed"}
         assert db.search_messages("needle", session_id_filter=[]) == []
 
+    def test_session_filter_limits_fts_work_to_allowed_sessions(self, db):
+        db.create_session(session_id="allowed-fast", source="api_server")
+        db.create_session(session_id="foreign-noisy", source="api_server")
+        db.append_message("allowed-fast", "user", "needle allowed")
+        for index in range(1000):
+            db.append_message(
+                "foreign-noisy", "user", f"needle foreign {index}"
+            )
+
+        results = db.search_messages(
+            "needle",
+            session_id_filter=["allowed-fast"],
+            role_filter=["user", "assistant"],
+            limit=1,
+            include_context=False,
+            distinct_sessions=True,
+            raise_fts_errors=True,
+            max_vm_steps=1000,
+        )
+
+        assert [result["session_id"] for result in results] == ["allowed-fast"]
+
     def test_search_session_id_filter_scopes_short_cjk_fallback(self, db):
         db.create_session(session_id="allowed-cjk", source="api_server")
         db.create_session(session_id="foreign-cjk", source="api_server")
