@@ -1852,6 +1852,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -1990,6 +1991,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            reasoning_callback=reasoning_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -3266,10 +3268,20 @@ class APIServerAdapter(BasePlatformAdapter):
             if delta:
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
+        def _reasoning(delta: str) -> None:
+            if delta:
+                _enqueue("tool.progress", {
+                    "message_id": message_id,
+                    "tool_name": "_thinking",
+                    "delta": delta[:100_000],
+                })
+
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
-            if event_type == "reasoning.available":
-                _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
-            elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
+            # Structured model reasoning travels through ``reasoning_callback``.
+            # ``reasoning.available`` is a legacy progress hook whose preview is
+            # derived from ordinary assistant prose, so exposing it here would
+            # duplicate the final answer under a misleading reasoning label.
+            if event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
@@ -3289,6 +3301,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=system_prompt,
                         session_id=turn_session_id,
                         stream_delta_callback=_delta,
+                        reasoning_callback=_reasoning,
                         tool_progress_callback=_tool_progress,
                         gateway_session_key=gateway_session_key,
                         request_route=request_route,
@@ -5390,6 +5403,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -5435,6 +5449,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
                         stream_delta_callback=stream_delta_callback,
+                        reasoning_callback=reasoning_callback,
                         tool_progress_callback=tool_progress_callback,
                         tool_start_callback=tool_start_callback,
                         tool_complete_callback=tool_complete_callback,
