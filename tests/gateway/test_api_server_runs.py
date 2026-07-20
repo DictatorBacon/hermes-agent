@@ -335,7 +335,8 @@ class TestRunEvents:
 
                 def _run_conversation(**_kwargs):
                     callbacks = mock_create.call_args.kwargs
-                    callbacks["reasoning_callback"]("structured reasoning")
+                    callbacks["reasoning_callback"]("structured ")
+                    callbacks["reasoning_callback"]("reasoning")
                     callbacks["tool_progress_callback"](
                         "reasoning.available",
                         tool_name="_thinking",
@@ -358,7 +359,8 @@ class TestRunEvents:
                 body = await events_resp.text()
 
                 assert "reasoning.available" in body
-                assert "structured reasoning" in body
+                assert '"delta": "reasoning"' in body
+                assert '"text": "structured reasoning"' in body
                 assert "legacy assistant prose" not in body
 
 

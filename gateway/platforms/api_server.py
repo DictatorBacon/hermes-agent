@@ -5666,19 +5666,23 @@ class APIServerAdapter(BasePlatformAdapter):
         # Structured model reasoning is emitted independently from assistant
         # text. Keep the existing event name for API compatibility while also
         # exposing the chunk explicitly as a delta.
+        reasoning_text = ""
+
         def _reasoning_cb(delta: Optional[str]) -> None:
+            nonlocal reasoning_text
             if delta is None:
                 return
             if run_id not in self._run_streams:
                 return
             bounded_delta = delta[:100_000]
+            reasoning_text = (reasoning_text + bounded_delta)[:100_000]
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "delta": bounded_delta,
-                    "text": bounded_delta,
+                    "text": reasoning_text,
                 })
             except Exception:
                 pass
