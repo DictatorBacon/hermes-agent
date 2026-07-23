@@ -3747,7 +3747,7 @@ class TestSessionIdHeader:
         """When X-Hermes-Session-Id is provided, it's passed to the agent and echoed in the response."""
         mock_result = {"final_response": "Continuing!", "messages": [], "api_calls": 1}
         mock_db = MagicMock()
-        mock_db.get_messages_as_conversation.return_value = [
+        mock_db.get_messages_as_model_conversation.return_value = [
             {"role": "user", "content": "previous message"},
             {"role": "assistant", "content": "previous reply"},
         ]
@@ -3854,7 +3854,7 @@ class TestSessionIdHeader:
             {"role": "assistant", "content": "stored reply 1"},
         ]
         mock_db = MagicMock()
-        mock_db.get_messages_as_conversation.return_value = db_history
+        mock_db.get_messages_as_model_conversation.return_value = db_history
         auth_adapter._session_db = mock_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3941,7 +3941,7 @@ class TestSessionKeyHeader:
         """Both headers coexist: key scopes memory, id scopes transcript."""
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
         mock_db = MagicMock()
-        mock_db.get_messages_as_conversation.return_value = []
+        mock_db.get_messages_as_model_conversation.return_value = []
         auth_adapter._session_db = mock_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:

@@ -306,7 +306,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
-    if getattr(agent, "_reduced_authority", False):
+    if getattr(agent, "_reduced_authority", False) is True:
         safe_prompt = system_message or getattr(agent, "ephemeral_system_prompt", None)
         if not isinstance(safe_prompt, str) or not safe_prompt.strip():
             raise ValueError("Reduced-authority turns require an explicit safe system prompt")

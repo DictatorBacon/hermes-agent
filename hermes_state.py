@@ -110,6 +110,13 @@ def redact_message_for_model(message: Dict[str, Any]) -> Dict[str, Any]:
     return projected
 
 
+def redact_messages_for_model(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return model-safe copies of durable message projections."""
+    return [redact_message_for_model(message) for message in messages]
+
+
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
     """A session's workspace grouping key: its git repo root when known, else
     its cwd.
@@ -5859,7 +5866,9 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
-        Used by the gateway to restore conversation history.
+        This is the authorized raw transcript projection used by display and
+        export surfaces. Model replay callers must use
+        :meth:`get_messages_as_model_conversation`.
 
         By default only active messages are returned. Pass
         ``include_inactive=True`` to load soft-deleted (rewound) rows
@@ -5903,12 +5912,6 @@ class SessionDB:
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])
-            platform_marker = row["platform_message_id"]
-            content = redact_message_for_model({
-                "role": row["role"],
-                "content": content,
-                "platform_message_id": platform_marker,
-            })["content"]
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
@@ -5995,6 +5998,28 @@ class SessionDB:
                     session_id,
                 )
         return messages
+
+    def get_messages_as_model_conversation(
+        self,
+        session_id: str,
+        include_ancestors: bool = False,
+        include_inactive: bool = False,
+        repair_alternation: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Load replay history through the reduced-authority model boundary.
+
+        Authorized display and export callers use
+        :meth:`get_messages_as_conversation` and receive the actual durable
+        transcript. Every caller that will feed history to a model must use
+        this explicit projection instead.
+        """
+        messages = self.get_messages_as_conversation(
+            session_id,
+            include_ancestors=include_ancestors,
+            include_inactive=include_inactive,
+            repair_alternation=repair_alternation,
+        )
+        return redact_messages_for_model(messages)
 
     def get_conversation_root(self, session_id: str) -> str:
         """Return the ROOT id of *session_id*'s lineage chain.

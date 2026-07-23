@@ -2853,30 +2853,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            history = db.get_messages_as_conversation(session_id)
-            safe_history = []
-            for message in history:
-                marker = message.get("message_id") if isinstance(message, dict) else None
-                if (
-                    isinstance(marker, str)
-                    and marker.startswith("workspace-reduced-output:")
-                    and message.get("role") == "assistant"
-                ):
-                    safe_history.append({
-                        "role": "assistant",
-                        "content": (
-                            "[Prior reduced-authority attachment response omitted "
-                            "from tool-enabled context.]"
-                        ),
-                        "message_id": marker,
-                        **(
-                            {"timestamp": message["timestamp"]}
-                            if "timestamp" in message else {}
-                        ),
-                    })
-                else:
-                    safe_history.append(message)
-            return safe_history
+            return db.get_messages_as_model_conversation(session_id)
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -3597,7 +3574,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if isinstance(candidate, str) and candidate:
                 resolved_session_id = candidate
             if load_persisted_history:
-                resolved_history = db.get_messages_as_conversation(resolved_session_id)
+                resolved_history = db.get_messages_as_model_conversation(
+                    resolved_session_id
+                )
         except Exception as exc:
             raise _SessionContinuityUnavailable(
                 f"Session continuity state is unavailable: {exc}"

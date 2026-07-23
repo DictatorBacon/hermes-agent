@@ -1352,9 +1352,11 @@ def init_agent(
     agent._end_session_on_close = True
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
-    # background skill/memory review fork so its harness turn can't leak into
-    # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    # background skill/memory review fork and reduced-authority attachment
+    # turns so their private harness/input can never enter the canonical
+    # session store. Successful reduced turns are persisted separately by the
+    # API adapter as one sanitized atomic pair.
+    agent._persist_disabled = bool(reduced_authority)
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

@@ -33,6 +33,7 @@ def test_reduced_authority_is_established_during_agent_construction():
     assert agent._skip_plugin_hooks is True
     assert agent._skip_extension_middleware is True
     assert agent._environment_probe is False
+    assert agent._persist_disabled is True
 
 
 def test_reduced_authority_skips_error_hooks_before_discovery():
@@ -126,3 +127,83 @@ def test_reduced_authority_ignores_hidden_moa_envelopes():
         ) == ("encoded envelope", None)
 
     decode.assert_not_called()
+
+
+def test_reduced_authority_incomplete_first_response_never_summarizes_or_persists():
+    agent = _reduced_agent(
+        ephemeral_system_prompt="SAFE ATTACHMENT POLICY",
+    )
+    reasoning_only = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=None,
+                    reasoning_content="Still reasoning; no answer yet.",
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model=agent.model,
+        usage=None,
+    )
+    synthetic_summary_success = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="This second request must never happen.",
+                    tool_calls=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model=agent.model,
+        usage=None,
+    )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        reasoning_only,
+        synthetic_summary_success,
+    ]
+
+    with (
+        patch.object(agent, "_save_session_log") as save_session_log,
+        patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+        ) as flush_messages_to_session_db,
+        patch.object(
+            agent,
+            "_handle_max_iterations",
+            return_value="forbidden summary",
+        ) as max_iteration_summary,
+        patch(
+            "agent.turn_finalizer._fresh_long_turn_final_response",
+            return_value="forbidden refinement",
+        ) as long_turn_refinement,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "UNTRUSTED_ATTACHMENT_SENTINEL",
+            conversation_history=[],
+        )
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["final_response"] is None
+    assert result["api_calls"] == 1
+    assert sum(
+        message.get("role") == "user" for message in result["messages"]
+    ) == 1
+    roles = [
+        message.get("role")
+        for message in result["messages"]
+        if message.get("role") in {"user", "assistant", "tool"}
+    ]
+    assert all(left != right for left, right in zip(roles, roles[1:]))
+    max_iteration_summary.assert_not_called()
+    long_turn_refinement.assert_not_called()
+    save_session_log.assert_not_called()
+    flush_messages_to_session_db.assert_not_called()

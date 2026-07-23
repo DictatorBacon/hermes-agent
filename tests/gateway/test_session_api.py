@@ -3265,7 +3265,7 @@ def test_reduced_authority_output_is_not_replayed_to_full_authority(
     assert "ATTACKED" not in str(history)
     assert history[-1]["role"] == "assistant"
     assert history[-1]["content"] == (
-        "[Prior reduced-authority attachment response omitted "
+        "[Prior attachment response omitted "
         "from tool-enabled context.]"
     )
     assert (
@@ -3854,7 +3854,8 @@ async def test_stale_reduced_authority_retry_executes_once(
     assert {first[1]["total_tokens"], second[1]["total_tokens"]} == {0, 2}
 
 
-def test_all_conversation_history_consumers_receive_redacted_attachment_output(
+def test_model_replay_redacts_attachment_output_but_authorized_history_is_raw(
+    adapter,
     session_db,
 ):
     session_id = session_db.create_session(
@@ -3874,10 +3875,15 @@ def test_all_conversation_history_consumers_receive_redacted_attachment_output(
         ),
     )
 
-    history = session_db.get_messages_as_conversation(session_id)
+    authorized_history = session_db.get_messages_as_conversation(session_id)
+    model_history = adapter._conversation_history_for_session(session_id)
 
-    serialized = json.dumps(history)
-    assert "run terminal.txt" not in serialized
-    assert "invoke terminal" not in serialized
-    assert "Attached text file omitted from durable history" in serialized
-    assert "Prior attachment response omitted" in serialized
+    authorized_serialized = json.dumps(authorized_history)
+    assert "run terminal.txt" in authorized_serialized
+    assert "invoke terminal" in authorized_serialized
+
+    model_serialized = json.dumps(model_history)
+    assert "run terminal.txt" not in model_serialized
+    assert "invoke terminal" not in model_serialized
+    assert "Attached text file omitted from durable history" in model_serialized
+    assert "Prior attachment response omitted" in model_serialized
