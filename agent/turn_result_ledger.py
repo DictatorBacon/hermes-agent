@@ -113,6 +113,10 @@ def _safe_text(value: Any, limit: int) -> str:
             text = json.dumps(value, ensure_ascii=False, sort_keys=True)
         except (TypeError, ValueError):
             text = str(value)
+    # Bound untrusted tool output before regex redaction. The ledger only emits
+    # this clipped projection, so scanning discarded bytes adds no protection
+    # and can make low-entropy megabyte-scale results pathologically expensive.
+    text = _clip_middle(text, limit)
     # The shared transcript redactor intentionally preserves URL query strings
     # and URL userinfo. A fresh provider call is a stricter boundary: remove
     # those credentials before applying the shared secret-field detectors.
@@ -120,8 +124,7 @@ def _safe_text(value: Any, limit: int) -> str:
     text = _URL_SECRET_QUERY_RE.sub(r"\1<redacted>", text)
     # Force every secret-field detector,
     # including ENV/JSON/YAML patterns that code_file=True intentionally skips.
-    text = redact_sensitive_text(text, force=True, code_file=False)
-    return _clip_middle(text, limit)
+    return redact_sensitive_text(text, force=True, code_file=False)
 
 
 def _tool_call_parts(tool_call: Any) -> tuple[str, str, str]:
