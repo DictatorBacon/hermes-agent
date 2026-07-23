@@ -192,6 +192,38 @@ def _model_facing_snippet(
     return raw_snippet
 
 
+def _anchor_content_is_model_visible(
+    db,
+    match_info: Dict[str, Any],
+) -> bool:
+    """Fail closed when an FTS anchor changes at the model boundary."""
+    session_id = match_info.get("session_id")
+    message_id = match_info.get("id")
+    if not session_id or message_id is None:
+        return False
+    try:
+        anchor_view = db.get_messages_around(
+            session_id,
+            message_id,
+            window=0,
+        )
+    except Exception:
+        logging.debug(
+            "get_messages_around failed while validating discovery anchor %s/%s",
+            session_id,
+            message_id,
+            exc_info=True,
+        )
+        return False
+
+    for message in anchor_view.get("window") or []:
+        if message.get("id") != message_id:
+            continue
+        safe_message = redact_message_for_model(message)
+        return safe_message.get("content") == message.get("content")
+    return False
+
+
 def _resolve_profile_db(profile: str):
     """Open another profile's ``state.db`` read-only, or None for the current one.
 
@@ -584,6 +616,11 @@ def _discover(
     # top `limit` results (#19434). Stable — preserves BM25/recency order
     # within each class.
     raw_results = _order_for_recall(raw_results)
+    raw_results = [
+        result
+        for result in raw_results
+        if _anchor_content_is_model_visible(db, result)
+    ]
 
     if not raw_results and not title_result:
         return json.dumps({
