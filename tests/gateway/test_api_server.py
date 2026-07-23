@@ -25,6 +25,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
@@ -35,6 +36,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_state import _REDUCED_AUTHORITY_TURN_CLAIM_LEASE_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +479,104 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["model"] == "primary/model"
+
+
+class TestReducedAuthorityProviderTimeout:
+    @staticmethod
+    def _capture_agent_kwargs(monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+        return adapter, captured
+
+    def test_default_1800_second_timeout_is_capped_before_reduced_agent_construction(
+        self,
+        monkeypatch,
+    ):
+        adapter, captured = self._capture_agent_kwargs(monkeypatch)
+        monkeypatch.setenv("HERMES_API_TIMEOUT", "1800")
+        monkeypatch.setattr(
+            "hermes_cli.timeouts.get_provider_request_timeout",
+            lambda *_args: None,
+        )
+
+        adapter._create_agent(session_id="reduced", reduced_authority=True)
+
+        assert captured["request_timeout_seconds"] == (
+            api_server_module._REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS
+        )
+        assert captured["request_timeout_seconds"] <= 600
+
+    def test_already_short_provider_timeout_stays_short(self, monkeypatch):
+        adapter, captured = self._capture_agent_kwargs(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.timeouts.get_provider_request_timeout",
+            lambda *_args: 45.0,
+        )
+
+        adapter._create_agent(session_id="reduced", reduced_authority=True)
+
+        assert captured["request_timeout_seconds"] == 45.0
+
+    def test_authenticated_reduced_provider_route_receives_the_same_safe_cap(
+        self,
+        monkeypatch,
+    ):
+        adapter, captured = self._capture_agent_kwargs(monkeypatch)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            lambda provider, **_kwargs: {
+                "provider": provider,
+                "api_key": "route-key",
+                "base_url": "https://route.example/v1",
+                "api_mode": "anthropic_messages",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.timeouts.get_provider_request_timeout",
+            lambda *_args: 1800.0,
+        )
+
+        adapter._create_agent(
+            session_id="reduced",
+            request_route={
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+            },
+            reduced_authority=True,
+        )
+
+        assert captured["provider"] == "anthropic"
+        assert captured["request_timeout_seconds"] == (
+            api_server_module._REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS
+        )
+
+    def test_supported_reduced_calls_are_bounded_below_claim_lease(self):
+        timeout_cap = (
+            api_server_module._REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS
+        )
+        assert 0 < timeout_cap <= 600
+        assert (
+            timeout_cap
+            < _REDUCED_AUTHORITY_TURN_CLAIM_LEASE_SECONDS
+        )
+
+    def test_normal_agent_construction_does_not_override_provider_timeout(
+        self,
+        monkeypatch,
+    ):
+        adapter, captured = self._capture_agent_kwargs(monkeypatch)
+
+        adapter._create_agent(session_id="normal", reduced_authority=False)
+
+        assert "request_timeout_seconds" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -4099,7 +4199,7 @@ def _patch_create_agent_runtime(monkeypatch, captured: dict, fake_agent_cls):
     monkeypatch.setattr("run_agent.AIAgent", fake_agent_cls)
     monkeypatch.setattr(
         "gateway.run._resolve_runtime_agent_kwargs",
-        lambda: {
+        lambda **_kwargs: {
             "provider": "openrouter",
             "api_key": "sk-global",
             "base_url": "https://openrouter.ai/api/v1",

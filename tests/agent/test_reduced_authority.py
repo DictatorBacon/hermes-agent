@@ -36,6 +36,15 @@ def test_reduced_authority_is_established_during_agent_construction():
     assert agent._persist_disabled is True
 
 
+def test_reduced_authority_timeout_override_reaches_client_and_request_paths():
+    with patch("run_agent.get_provider_request_timeout", return_value=1800.0):
+        agent = _reduced_agent(request_timeout_seconds=600.0)
+
+    assert agent._resolved_provider_request_timeout() == 600.0
+    assert agent._resolved_api_call_timeout() == 600.0
+    assert agent._client_kwargs["timeout"] == 600.0
+
+
 def test_reduced_authority_skips_error_hooks_before_discovery():
     agent = _reduced_agent()
 

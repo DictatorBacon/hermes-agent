@@ -18,6 +18,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     MAX_REQUEST_BYTES,
+    body_limit_middleware,
     _reduced_authority_message,
     _reduced_authority_payload_hash,
     _session_chat_runtime_overrides,
@@ -70,7 +71,11 @@ def auth_adapter(session_db):
 
 
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
-    app = web.Application(client_max_size=MAX_REQUEST_BYTES)
+    middlewares = [body_limit_middleware] if body_limit_middleware is not None else []
+    app = web.Application(
+        middlewares=middlewares,
+        client_max_size=MAX_REQUEST_BYTES,
+    )
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
@@ -2683,6 +2688,82 @@ async def test_reduced_authority_route_accepts_two_validated_input_images(
     assert captured["requires_vision"] is True
     assert _VALID_PNG_DATA_URL not in body
     assert _VALID_JPEG_DATA_URL not in body
+
+
+@pytest.mark.asyncio
+async def test_reduced_authority_http_route_accepts_full_8mib_raw_image_allowance(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "full-image-allowance-session",
+        "api_server",
+    )
+    raw_image = b"\x89PNG\r\n\x1a\n" + (
+        b"x" * ((4 * 1024 * 1024) - 8)
+    )
+    data_url = (
+        "data:image/png;base64,"
+        + base64.b64encode(raw_image).decode("ascii")
+    )
+    request_body = json.dumps(
+        {
+            "message": [
+                _input_image(data_url),
+                _input_image(data_url),
+            ],
+            "untrusted_context": [],
+            "turn_correlation_id": "a" * 32,
+        },
+        separators=(",", ":"),
+    )
+    assert len(request_body.encode("utf-8")) > 10_000_000
+    assert len(request_body.encode("utf-8")) < 16 * 1024 * 1024
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "Compared.", "session_id": session_id},
+            {},
+        )
+    )
+    app = _create_session_app(adapter)
+
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                data=request_body,
+                headers={"Content-Type": "application/json"},
+            )
+            response_body = await response.text()
+
+    assert response.status == 200, response_body
+    mock_run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_body_over_16mib_without_agent_call(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "over-server-body-cap-session",
+        "api_server",
+    )
+    mock_run = AsyncMock()
+    app = _create_session_app(adapter)
+
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                data=b"x" * ((16 * 1024 * 1024) + 1),
+                headers={"Content-Type": "application/json"},
+            )
+            response_body = await response.json()
+
+    assert response.status == 413
+    assert response_body["error"]["code"] == "body_too_large"
+    mock_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -489,6 +489,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         reduced_authority: bool = False,
+        request_timeout_seconds: float = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -566,6 +567,7 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
             reduced_authority=reduced_authority,
+            request_timeout_seconds=request_timeout_seconds,
         )
 
     def _get_session_db_for_recall(self):
@@ -1251,6 +1253,13 @@ class AIAgent:
             return False
         return hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com")
 
+    def _resolved_provider_request_timeout(self) -> Optional[float]:
+        """Return an explicit per-agent timeout or the provider configuration."""
+        override = getattr(self, "_request_timeout_seconds", None)
+        if override is not None:
+            return override
+        return get_provider_request_timeout(self.provider, self.model)
+
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
 
@@ -1266,7 +1275,7 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = self._resolved_provider_request_timeout()
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -4516,7 +4525,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_provider_request_timeout(),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -4638,7 +4647,7 @@ class AIAgent:
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_provider_request_timeout(),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -4701,13 +4710,16 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
+            self._anthropic_client = build_anthropic_bedrock_client(
+                region,
+                timeout=self._resolved_provider_request_timeout(),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_provider_request_timeout(),
                 drop_context_1m_beta=_drop_1m,
             )
 

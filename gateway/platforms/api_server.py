@@ -47,6 +47,7 @@ import errno
 import hashlib
 import hmac
 import json
+import math
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
@@ -125,7 +126,11 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+# 8 MiB of permitted raw images expands to about 10.7 MiB in base64 before the
+# JSON envelope. Keep bounded headroom for mixed text/file metadata and the
+# WebUI's four 2 MiB images; route validators retain their tighter per-part and
+# aggregate limits.
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -451,10 +456,34 @@ _REDUCED_AUTHORITY_MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
 _REDUCED_AUTHORITY_ATTACHMENTS_VERSION = 1
 _REDUCED_AUTHORITY_PENDING_WAIT_SECONDS = 0.5
 _REDUCED_AUTHORITY_RETRY_AFTER_SECONDS = 1.0
+# The durable claim lease is 15 minutes. Leave five minutes of process and
+# persistence headroom so a live direct-provider request cannot still be
+# running when another process is allowed to reclaim its correlation ID.
+_REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS = 10 * 60
 _REDUCED_AUTHORITY_IMAGE_DATA_URL_RE = re.compile(
     r"data:(image/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})\Z",
     re.IGNORECASE,
 )
+
+
+def _reduced_authority_provider_timeout(provider: str, model: str) -> float:
+    """Resolve a fail-closed provider timeout below the claim lease."""
+    from hermes_cli.timeouts import get_provider_request_timeout
+    from utils import env_float
+
+    configured = get_provider_request_timeout(provider, model)
+    resolved = (
+        configured
+        if configured is not None
+        else env_float("HERMES_API_TIMEOUT", 1800.0)
+    )
+    try:
+        timeout = float(resolved)
+    except (TypeError, ValueError):
+        timeout = _REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = _REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS
+    return min(timeout, _REDUCED_AUTHORITY_PROVIDER_TIMEOUT_MAX_SECONDS)
 
 
 def _normalize_reduced_authority_message(content: Any) -> Any:
@@ -2496,6 +2525,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "Reduced-authority image turns require a vision-capable "
                     "direct model route"
                 )
+
+        if reduced_authority:
+            # This is resolved only after static/session/authenticated request
+            # routing has selected the final direct provider and model, but
+            # before AIAgent constructs any SDK client.
+            runtime_kwargs["request_timeout_seconds"] = (
+                _reduced_authority_provider_timeout(provider_name, model)
+            )
 
         max_iterations = 1 if reduced_authority else _current_max_iterations()
 
