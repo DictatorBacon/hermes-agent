@@ -49,6 +49,18 @@ class ReducedAuthorityTurnConflictError(RuntimeError):
     """A reduced-authority correlation ID was reused for another payload."""
 
 
+class ReducedAuthorityTurnInFlightError(RuntimeError):
+    """An identical reduced-authority turn still owns a fresh durable claim."""
+
+    code = "turn_in_flight"
+
+    def __init__(self, *, retry_after_seconds: float):
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds))
+        super().__init__(
+            "Reduced-authority turn is still in flight; retry later"
+        )
+
+
 _REDUCED_AUTHORITY_USER_MARKER = "workspace-run:"
 _REDUCED_AUTHORITY_ASSISTANT_MARKER = "workspace-reduced-output:"
 _REDUCED_AUTHORITY_USER_ATTACHMENT_RE = re.compile(
@@ -60,6 +72,12 @@ _REDUCED_AUTHORITY_USER_PLACEHOLDER = (
 _REDUCED_AUTHORITY_ASSISTANT_PLACEHOLDER = (
     "[Prior attachment response omitted from tool-enabled context.]"
 )
+# A reduced-authority model turn is bounded to one API iteration. This lease
+# is only a crash-recovery backstop for a process that died after durably
+# claiming a correlation ID; live contenders still observe a fresh claim as
+# pending. Keep this server-owned rather than user-configurable so a stale row
+# can never block the endpoint indefinitely.
+_REDUCED_AUTHORITY_TURN_CLAIM_LEASE_SECONDS = 15 * 60
 
 
 def redact_message_for_model(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -4860,13 +4878,16 @@ class SessionDB:
         *,
         correlation_id: str,
         payload_hash: str,
-    ) -> str:
+        with_lease: bool = False,
+    ):
         """Atomically claim one request identity.
 
         Returns ``"claimed"`` to the one caller that may execute the model,
         ``"pending"`` while that caller is still running, or ``"completed"``
         when a durable replay is ready. Reusing the correlation ID with any
-        other canonical payload fails before model execution.
+        other canonical payload fails before model execution. When
+        *with_lease* is true, also return the durable ``claimed_at`` generation
+        that must fence abandon/completion after a stale-claim takeover.
         """
         self._validate_reduced_authority_turn_identity(
             correlation_id,
@@ -4874,9 +4895,14 @@ class SessionDB:
         )
 
         def _do(conn):
+            now = time.time()
+
+            def _result(state: str, lease: float):
+                return (state, lease) if with_lease else state
+
             row = conn.execute(
                 """
-                SELECT payload_hash, state
+                SELECT payload_hash, state, claimed_at
                 FROM reduced_authority_turn_claims
                 WHERE session_id = ? AND correlation_id = ?
                 """,
@@ -4888,20 +4914,55 @@ class SessionDB:
                         "Reduced-authority turn correlation ID was reused "
                         "with a different payload"
                     )
-                return (
-                    "completed"
-                    if row["state"] == "completed"
-                    else "pending"
+                if row["state"] == "completed":
+                    return _result("completed", float(row["claimed_at"]))
+                raw_claimed_at = row["claimed_at"]
+                try:
+                    claimed_at = float(raw_claimed_at)
+                except (TypeError, ValueError):
+                    claimed_at = now - _REDUCED_AUTHORITY_TURN_CLAIM_LEASE_SECONDS
+                stale_before = (
+                    now - _REDUCED_AUTHORITY_TURN_CLAIM_LEASE_SECONDS
                 )
+                if claimed_at > stale_before:
+                    return _result("pending", claimed_at)
+                # The claimed_at predicate is the lease-generation CAS. Along
+                # with BEGIN IMMEDIATE it makes stale takeover single-winner:
+                # the next contender sees the refreshed generation as pending.
+                takeover = conn.execute(
+                    """
+                    UPDATE reduced_authority_turn_claims
+                    SET state = 'claimed',
+                        claimed_at = ?,
+                        user_message_id = NULL,
+                        assistant_message_id = NULL,
+                        completed_at = NULL
+                    WHERE session_id = ? AND correlation_id = ?
+                      AND payload_hash = ? AND state = 'claimed'
+                      AND claimed_at = ?
+                    """,
+                    (
+                        now,
+                        session_id,
+                        correlation_id,
+                        payload_hash,
+                        raw_claimed_at,
+                    ),
+                )
+                if takeover.rowcount != 1:
+                    raise RuntimeError(
+                        "Reduced-authority stale claim takeover lost its lease"
+                    )
+                return _result("claimed", now)
             conn.execute(
                 """
                 INSERT INTO reduced_authority_turn_claims
                     (session_id, correlation_id, payload_hash, state, claimed_at)
                 VALUES (?, ?, ?, 'claimed', ?)
                 """,
-                (session_id, correlation_id, payload_hash, time.time()),
+                (session_id, correlation_id, payload_hash, now),
             )
-            return "claimed"
+            return _result("claimed", now)
 
         return self._execute_write(_do)
 
@@ -4911,6 +4972,7 @@ class SessionDB:
         *,
         correlation_id: str,
         payload_hash: str,
+        claim_lease: float,
     ) -> None:
         """Release an unfinished claim after a failed model run."""
         self._validate_reduced_authority_turn_identity(
@@ -4924,8 +4986,14 @@ class SessionDB:
                 DELETE FROM reduced_authority_turn_claims
                 WHERE session_id = ? AND correlation_id = ?
                   AND payload_hash = ? AND state = 'claimed'
+                  AND claimed_at = ?
                 """,
-                (session_id, correlation_id, payload_hash),
+                (
+                    session_id,
+                    correlation_id,
+                    payload_hash,
+                    claim_lease,
+                ),
             )
 
         self._execute_write(_do)
@@ -4998,6 +5066,13 @@ class SessionDB:
         user_content: str,
         assistant_content: str,
         finish_reason: str = None,
+        claim_lease: Optional[float] = None,
+        usage: Optional[Dict[str, Any]] = None,
+        api_call_count: int = 0,
+        model: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
     ) -> tuple[int, int]:
         """Atomically append or replay one reduced-authority Workspace turn.
 
@@ -5013,33 +5088,75 @@ class SessionDB:
         if not isinstance(user_content, str) or not isinstance(assistant_content, str):
             raise TypeError("Reduced-authority turn content must be text")
 
+        usage = usage if isinstance(usage, dict) else {}
+
+        def _counter(name: str) -> int:
+            value = int(usage.get(name, 0) or 0)
+            if value < 0:
+                raise ValueError(
+                    f"Reduced-authority turn {name} must be non-negative"
+                )
+            return value
+
+        input_tokens = _counter("input_tokens")
+        output_tokens = _counter("output_tokens")
+        cache_read_tokens = _counter("cache_read_tokens")
+        cache_write_tokens = _counter("cache_write_tokens")
+        reasoning_tokens = _counter("reasoning_tokens")
+        api_call_count = int(api_call_count or 0)
+        if api_call_count < 0:
+            raise ValueError(
+                "Reduced-authority turn api_call_count must be non-negative"
+            )
+        estimated_cost_usd = float(usage.get("estimated_cost_usd", 0.0) or 0.0)
+        if estimated_cost_usd < 0:
+            raise ValueError(
+                "Reduced-authority turn estimated cost must be non-negative"
+            )
+        cost_status = usage.get("cost_status")
+        cost_source = usage.get("cost_source")
+
         user_marker = f"workspace-run:{correlation_id}"
         assistant_marker = f"workspace-reduced-output:{correlation_id}"
         stored_user = self._encode_content(user_content)
         stored_assistant = self._encode_content(assistant_content)
 
         def _do(conn):
+            owns_claim = False
+            active_claim_lease = claim_lease
             claim = conn.execute(
                 """
-                SELECT payload_hash, state
+                SELECT payload_hash, state, claimed_at
                 FROM reduced_authority_turn_claims
                 WHERE session_id = ? AND correlation_id = ?
                 """,
                 (session_id, correlation_id),
             ).fetchone()
             if claim is None:
+                active_claim_lease = time.time()
                 conn.execute(
                     """
                     INSERT INTO reduced_authority_turn_claims
                         (session_id, correlation_id, payload_hash, state, claimed_at)
                     VALUES (?, ?, ?, 'claimed', ?)
                     """,
-                    (session_id, correlation_id, payload_hash, time.time()),
+                    (
+                        session_id,
+                        correlation_id,
+                        payload_hash,
+                        active_claim_lease,
+                    ),
                 )
+                owns_claim = True
             elif claim["payload_hash"] != payload_hash:
                 raise ReducedAuthorityTurnConflictError(
                     "Reduced-authority turn correlation ID was reused "
                     "with a different payload"
+                )
+            elif claim["state"] == "claimed":
+                owns_claim = (
+                    claim_lease is not None
+                    and float(claim["claimed_at"]) == float(claim_lease)
                 )
 
             existing = conn.execute(
@@ -5068,6 +5185,11 @@ class SessionDB:
                     )
                 return int(user_row["id"]), int(assistant_row["id"])
 
+            if not owns_claim:
+                raise RuntimeError(
+                    "Reduced-authority turn claim lease is no longer owned"
+                )
+
             now = time.time()
             user_cursor = conn.execute(
                 """
@@ -5093,12 +5215,72 @@ class SessionDB:
                 ),
             )
             conn.execute(
-                "UPDATE sessions SET message_count = message_count + 2 WHERE id = ?",
-                (session_id,),
+                """
+                UPDATE sessions
+                SET message_count = message_count + 2,
+                    input_tokens = input_tokens + ?,
+                    output_tokens = output_tokens + ?,
+                    cache_read_tokens = cache_read_tokens + ?,
+                    cache_write_tokens = cache_write_tokens + ?,
+                    reasoning_tokens = reasoning_tokens + ?,
+                    estimated_cost_usd =
+                        COALESCE(estimated_cost_usd, 0) + ?,
+                    cost_status = COALESCE(?, cost_status),
+                    cost_source = COALESCE(?, cost_source),
+                    billing_provider = COALESCE(billing_provider, ?),
+                    billing_base_url = COALESCE(billing_base_url, ?),
+                    billing_mode = COALESCE(billing_mode, ?),
+                    model = COALESCE(model, ?),
+                    api_call_count = COALESCE(api_call_count, 0) + ?
+                WHERE id = ?
+                """,
+                (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    estimated_cost_usd,
+                    cost_status,
+                    cost_source,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
+                    model,
+                    api_call_count,
+                    session_id,
+                ),
             )
+            if (
+                input_tokens
+                or output_tokens
+                or cache_read_tokens
+                or cache_write_tokens
+                or reasoning_tokens
+                or api_call_count
+                or estimated_cost_usd
+            ):
+                self._record_model_usage(
+                    conn,
+                    session_id,
+                    model=model,
+                    billing_provider=billing_provider,
+                    billing_base_url=billing_base_url,
+                    billing_mode=billing_mode,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    estimated_cost_usd=estimated_cost_usd,
+                    actual_cost_usd=None,
+                    cost_status=cost_status,
+                    cost_source=cost_source,
+                    api_call_count=api_call_count,
+                )
             user_id = int(user_cursor.lastrowid)
             assistant_id = int(assistant_cursor.lastrowid)
-            conn.execute(
+            completed = conn.execute(
                 """
                 UPDATE reduced_authority_turn_claims
                 SET state = 'completed',
@@ -5106,7 +5288,8 @@ class SessionDB:
                     assistant_message_id = ?,
                     completed_at = ?
                 WHERE session_id = ? AND correlation_id = ?
-                  AND payload_hash = ?
+                  AND payload_hash = ? AND state = 'claimed'
+                  AND claimed_at = ?
                 """,
                 (
                     user_id,
@@ -5115,8 +5298,13 @@ class SessionDB:
                     session_id,
                     correlation_id,
                     payload_hash,
+                    active_claim_lease,
                 ),
             )
+            if completed.rowcount != 1:
+                raise RuntimeError(
+                    "Reduced-authority turn claim lease is no longer owned"
+                )
             return user_id, assistant_id
 
         return self._execute_write(_do)

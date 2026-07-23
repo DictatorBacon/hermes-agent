@@ -1007,6 +1007,40 @@ class TestCapabilitiesEndpoint:
             assert data["auth"]["required"] is True
 
     @pytest.mark.asyncio
+    async def test_capabilities_is_bounded_and_omits_secrets_and_config(self):
+        api_key_sentinel = "CAPABILITY_API_KEY_SECRET_SENTINEL"
+        cors_sentinel = "CAPABILITY_CORS_CONFIG_SENTINEL"
+        route_secret_sentinel = "CAPABILITY_ROUTE_SECRET_SENTINEL"
+        configured_adapter = _make_adapter(
+            api_key=api_key_sentinel,
+            cors_origins=[f"https://{cors_sentinel}.example"],
+        )
+        configured_adapter._model_routes = {
+            f"route-{index}": {
+                "model": f"provider/model-{index}",
+                "api_key": route_secret_sentinel,
+                "base_url": f"https://route-{index}.example/v1",
+            }
+            for index in range(1_000)
+        }
+
+        configured_app = _create_app(configured_adapter)
+        async with TestClient(TestServer(configured_app)) as configured_cli:
+            configured_resp = await configured_cli.get(
+                "/v1/capabilities",
+                headers={"Authorization": f"Bearer {api_key_sentinel}"},
+            )
+            configured_body = await configured_resp.text()
+
+        assert configured_resp.status == 200
+        assert len(configured_body.encode("utf-8")) <= 16_384
+        assert api_key_sentinel not in configured_body
+        assert cors_sentinel not in configured_body
+        assert route_secret_sentinel not in configured_body
+        assert "route-999" not in configured_body
+        assert "config" not in json.loads(configured_body)
+
+    @pytest.mark.asyncio
     async def test_capabilities_advertises_reduced_authority_attachments_v1(
         self,
         auth_adapter,

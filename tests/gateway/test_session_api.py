@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import sqlite3
@@ -17,7 +18,10 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     MAX_REQUEST_BYTES,
+    _reduced_authority_message,
+    _reduced_authority_payload_hash,
     _session_chat_runtime_overrides,
+    _session_chat_untrusted_context,
 )
 from hermes_state import SessionDB
 
@@ -2593,6 +2597,82 @@ async def test_reduced_authority_route_accepts_file_only_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "completion_marker"),
+    [
+        ("chat", '"object": "hermes.session.chat.completion"'),
+        ("chat/stream", "event: assistant.completed"),
+    ],
+)
+async def test_reduced_authority_success_never_resolves_model_emitted_media_paths(
+    adapter,
+    session_db,
+    tmp_path,
+    endpoint,
+    completion_marker,
+):
+    session_id = session_db.create_session(
+        f"reduced-media-egress-{endpoint.replace('/', '-')}",
+        "api_server",
+    )
+    local_image = tmp_path / "model-emitted-secret.png"
+    local_image.write_bytes(b"\x89PNG\r\n\x1a\nPRIVATE_LOCAL_IMAGE_BYTES")
+    model_output = f"Safe summary.\nMEDIA:{local_image}"
+
+    async def fake_run(**kwargs):
+        return {
+            "session_id": session_id,
+            "final_response": model_output,
+            "persisted_user_message_id": "user-1",
+            "messages": [
+                {
+                    "id": "user-1",
+                    "role": "user",
+                    "content": kwargs["persist_user_message"],
+                },
+                {
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "content": model_output,
+                },
+            ],
+        }, {}
+
+    app = _create_session_app(adapter)
+    with (
+        patch.object(adapter, "_run_agent", side_effect=fake_run),
+        patch(
+            "gateway.platforms.api_server._resolve_media_to_data_urls",
+            side_effect=AssertionError(
+                "reduced-authority egress must not read local MEDIA paths"
+            ),
+        ) as resolve_media,
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/api/sessions/{session_id}/{endpoint}",
+                json={
+                    "message": "Summarize this file.",
+                    "untrusted_context": [{
+                        "name": "notes.txt",
+                        "media_type": "text/plain",
+                        "content": "private source text",
+                    }],
+                    "turn_correlation_id": "7" * 32,
+                },
+            )
+            body = await response.text()
+
+    assert response.status == 200
+    assert completion_marker in body
+    assert "Safe summary." in body
+    assert "MEDIA:" in body
+    assert local_image.name in body
+    assert "data:image/png;base64" not in body
+    resolve_media.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reduced_authority_multimodal_stream_lifecycle_never_echoes_inputs(
     adapter,
     session_db,
@@ -2802,6 +2882,74 @@ async def test_reduced_authority_run_is_ephemeral_then_persists_only_sanitized_t
 
 
 @pytest.mark.asyncio
+async def test_reduced_authority_ephemeral_agent_usage_persists_once_with_replay(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "isolated-attachment-usage",
+        "api_server",
+        model="test/model",
+    )
+    correlation_id = "c" * 32
+
+    class CountingAgent:
+        session_prompt_tokens = 17
+        session_completion_tokens = 5
+        session_total_tokens = 22
+        session_api_calls = 2
+        model = "test/model"
+        provider = "test-provider"
+        base_url = "https://provider.invalid/v1"
+        calls = 0
+
+        def run_conversation(self, **_kwargs):
+            type(self).calls += 1
+            return {
+                "final_response": "Persisted exactly once.",
+                "api_calls": 2,
+            }
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=CountingAgent(),
+    ) as create_agent:
+        first, _ = await adapter._run_agent(
+            user_message="raw private attachment",
+            conversation_history=[],
+            session_id=session_id,
+            persist_user_message="safe durable prompt",
+            reduced_authority=True,
+            turn_correlation_id=correlation_id,
+        )
+        replay, replay_usage = await adapter._run_agent(
+            user_message="raw private attachment",
+            conversation_history=[],
+            session_id=session_id,
+            persist_user_message="safe durable prompt",
+            reduced_authority=True,
+            turn_correlation_id=correlation_id,
+        )
+
+    assert create_agent.call_count == 1
+    assert CountingAgent.calls == 1
+    assert replay["persisted_user_message_id"] == (
+        first["persisted_user_message_id"]
+    )
+    assert replay_usage == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    persisted_session = session_db.get_session(session_id)
+    assert persisted_session["input_tokens"] == 17
+    assert persisted_session["output_tokens"] == 5
+    assert persisted_session["api_call_count"] == 2
+    assert len(session_db.get_messages(session_id)) == 2
+
+
+@pytest.mark.asyncio
 async def test_session_chat_rejects_custom_system_prompt_with_untrusted_context(
     auth_adapter, session_db
 ):
@@ -2918,6 +3066,147 @@ def test_reduced_authority_turn_persistence_is_atomic_and_idempotent(
     ]
 
 
+def test_reduced_authority_fresh_claim_stays_single_flight_after_restart(
+    tmp_path,
+):
+    db_path = tmp_path / "fresh-claim.db"
+    correlation_id = "8" * 32
+    payload_hash = "8" * 64
+    first_db = SessionDB(db_path)
+    session_id = first_db.create_session(
+        "fresh-reduced-claim",
+        "api_server",
+    )
+    assert first_db.claim_reduced_authority_turn(
+        session_id,
+        correlation_id=correlation_id,
+        payload_hash=payload_hash,
+    ) == "claimed"
+    first_db.close()
+
+    restarted_db = SessionDB(db_path)
+    try:
+        assert restarted_db.claim_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+        ) == "pending"
+    finally:
+        restarted_db.close()
+
+
+def test_reduced_authority_expired_claim_has_one_atomic_restart_takeover(
+    tmp_path,
+):
+    db_path = tmp_path / "expired-claim.db"
+    correlation_id = "9" * 32
+    payload_hash = "9" * 64
+    first_db = SessionDB(db_path)
+    session_id = first_db.create_session(
+        "expired-reduced-claim",
+        "api_server",
+    )
+    assert first_db.claim_reduced_authority_turn(
+        session_id,
+        correlation_id=correlation_id,
+        payload_hash=payload_hash,
+    ) == "claimed"
+    first_db._conn.execute(
+        """
+        UPDATE reduced_authority_turn_claims
+        SET claimed_at = 0
+        WHERE session_id = ? AND correlation_id = ?
+        """,
+        (session_id, correlation_id),
+    )
+    first_db._conn.commit()
+    first_db.close()
+
+    contenders = [SessionDB(db_path), SessionDB(db_path)]
+    barrier = threading.Barrier(2)
+
+    def claim(db):
+        barrier.wait()
+        return db.claim_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(claim, contenders))
+    finally:
+        for db in contenders:
+            db.close()
+
+    assert sorted(outcomes) == ["claimed", "pending"]
+
+
+def test_reduced_authority_expired_owner_cannot_abandon_or_complete_takeover(
+    session_db,
+):
+    session_id = session_db.create_session(
+        "fenced-reduced-claim",
+        "api_server",
+    )
+    correlation_id = "a" * 32
+    payload_hash = "a" * 64
+    with patch("hermes_state.time.time", return_value=1_000.0):
+        old_state, old_lease = session_db.claim_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+            with_lease=True,
+        )
+    assert old_state == "claimed"
+
+    with patch("hermes_state.time.time", return_value=10_000.0):
+        new_state, new_lease = session_db.claim_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+            with_lease=True,
+        )
+    assert new_state == "claimed"
+    assert new_lease != old_lease
+
+    session_db.abandon_reduced_authority_turn_claim(
+        session_id,
+        correlation_id=correlation_id,
+        payload_hash=payload_hash,
+        claim_lease=old_lease,
+    )
+    with pytest.raises(RuntimeError, match="lease is no longer owned"):
+        session_db.append_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+            user_content="sanitized user row",
+            assistant_content="stale assistant row",
+            claim_lease=old_lease,
+        )
+
+    assert session_db.get_messages(session_id) == []
+    with patch("hermes_state.time.time", return_value=10_001.0):
+        assert session_db.claim_reduced_authority_turn(
+            session_id,
+            correlation_id=correlation_id,
+            payload_hash=payload_hash,
+        ) == "pending"
+    session_db.append_reduced_authority_turn(
+        session_id,
+        correlation_id=correlation_id,
+        payload_hash=payload_hash,
+        user_content="sanitized user row",
+        assistant_content="successor assistant row",
+        claim_lease=new_lease,
+    )
+    assert [
+        message["content"] for message in session_db.get_messages(session_id)
+    ] == ["sanitized user row", "successor assistant row"]
+
+
 def test_reduced_authority_turn_persistence_rolls_back_both_rows(session_db):
     session_id = session_db.create_session(
         "failed-reduced-turn", "api_server"
@@ -2944,9 +3233,15 @@ def test_reduced_authority_turn_persistence_rolls_back_both_rows(session_db):
             payload_hash="2" * 64,
             user_content="sanitized user row",
             assistant_content="assistant row",
+            usage={"input_tokens": 13, "output_tokens": 5},
+            api_call_count=2,
         )
 
     assert session_db.get_messages(session_id) == []
+    persisted_session = session_db.get_session(session_id)
+    assert persisted_session["input_tokens"] == 0
+    assert persisted_session["output_tokens"] == 0
+    assert persisted_session["api_call_count"] == 0
 
 
 def test_reduced_authority_output_is_not_replayed_to_full_authority(
@@ -3101,6 +3396,97 @@ async def test_failed_or_incomplete_reduced_authority_sync_chat_is_bounded_502(
     assert leaked_output not in body
     assert "PRIVATE_PROVIDER_ERROR_SENTINEL" not in body
     assert "PRIVATE_FILE_TEXT_SENTINEL" not in body
+
+
+@pytest.mark.asyncio
+async def test_fresh_reduced_authority_claim_is_bounded_retryable_503(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "fresh-reduced-route-claim",
+        "api_server",
+    )
+    body = {
+        "message": "Summarize this file.",
+        "turn_correlation_id": "c" * 32,
+        "untrusted_context": [{
+            "name": "notes.txt",
+            "media_type": "text/plain",
+            "content": "private source text",
+        }],
+    }
+    user_message, error = _reduced_authority_message(body)
+    assert error is None
+    (
+        user_message,
+        persist_user_message,
+        reduced_authority,
+        forced_system_prompt,
+        error,
+    ) = _session_chat_untrusted_context(body, user_message)
+    assert error is None
+    payload_hash = _reduced_authority_payload_hash(
+        user_message=user_message,
+        persist_user_message=persist_user_message,
+        reduced_authority=reduced_authority,
+        ephemeral_system_prompt=forced_system_prompt,
+        route=None,
+        request_route=None,
+        reasoning_effort_override=None,
+        service_tier_override=None,
+    )
+    assert session_db.claim_reduced_authority_turn(
+        session_id,
+        correlation_id=body["turn_correlation_id"],
+        payload_hash=payload_hash,
+    ) == "claimed"
+    app = _create_session_app(adapter)
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=AssertionError(
+            "a fresh durable claim must remain single-flight"
+        ),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            response_task = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    json=body,
+                )
+            )
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.shield(response_task),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                session_db._execute_write(
+                    lambda conn: conn.execute(
+                        """
+                        UPDATE reduced_authority_turn_claims
+                        SET claimed_at = 0
+                        WHERE session_id = ? AND correlation_id = ?
+                        """,
+                        (session_id, body["turn_correlation_id"]),
+                    )
+                )
+                try:
+                    await response_task
+                except Exception:
+                    pass
+                pytest.fail(
+                    "fresh pending retry waited indefinitely instead of "
+                    "returning a retryable response"
+                )
+            payload = await response.json()
+
+    assert response.status == 503
+    assert response.headers["Retry-After"] == "1"
+    assert payload["error"]["code"] == "turn_in_flight"
+    assert payload["error"]["retryable"] is True
 
 
 @pytest.mark.asyncio
@@ -3260,6 +3646,91 @@ async def test_reduced_authority_route_rejects_correlation_payload_conflict_as_4
 
 
 @pytest.mark.asyncio
+async def test_reduced_authority_stream_conflict_has_deterministic_error_code(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "reduced-stream-conflict",
+        "api_server",
+    )
+    correlation_id = "7" * 32
+
+    class CountingAgent:
+        session_prompt_tokens = 1
+        session_completion_tokens = 1
+        session_total_tokens = 2
+        calls = 0
+
+        def run_conversation(self, **_kwargs):
+            type(self).calls += 1
+            return {"final_response": "safe response"}
+
+    app = _create_session_app(adapter)
+    with patch.object(
+        adapter,
+        "_create_agent",
+        return_value=CountingAgent(),
+    ) as create_agent:
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={
+                    "message": "Summarize.",
+                    "untrusted_context": [{
+                        "name": "notes.txt",
+                        "media_type": "text/plain",
+                        "content": "first private payload",
+                    }],
+                    "turn_correlation_id": correlation_id,
+                },
+            )
+            conflict = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={
+                    "message": "Summarize.",
+                    "untrusted_context": [{
+                        "name": "notes.txt",
+                        "media_type": "text/plain",
+                        "content": "second private payload",
+                    }],
+                    "turn_correlation_id": correlation_id,
+                },
+            )
+            conflict_body = await conflict.text()
+
+    error_payloads = []
+    for event in conflict_body.split("\n\n"):
+        lines = event.splitlines()
+        if "event: error" not in lines:
+            continue
+        data_line = next(
+            line for line in lines if line.startswith("data: ")
+        )
+        error_payloads.append(json.loads(data_line.removeprefix("data: ")))
+
+    assert first.status == 200
+    assert conflict.status == 200
+    assert len(error_payloads) == 1
+    assert error_payloads[0] == {
+        "message": (
+            "turn_correlation_id was reused with a different request payload."
+        ),
+        "code": "turn_correlation_conflict",
+        "param": "turn_correlation_id",
+        "retryable": False,
+        "session_id": session_id,
+        "run_id": error_payloads[0]["run_id"],
+        "seq": error_payloads[0]["seq"],
+        "ts": error_payloads[0]["ts"],
+    }
+    assert "first private payload" not in conflict_body
+    assert "second private payload" not in conflict_body
+    assert create_agent.call_count == 1
+    assert CountingAgent.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_identical_concurrent_reduced_authority_retries_execute_once(
     adapter,
     session_db,
@@ -3303,6 +3774,83 @@ async def test_identical_concurrent_reduced_authority_retries_execute_once(
     assert create_agent.call_count == 1
     assert SlowCountingAgent.calls == 1
     assert first[0]["final_response"] == second[0]["final_response"] == "response-1"
+    assert {first[1]["total_tokens"], second[1]["total_tokens"]} == {0, 2}
+
+
+@pytest.mark.asyncio
+async def test_stale_reduced_authority_retry_executes_once(
+    adapter,
+    session_db,
+):
+    session_id = session_db.create_session(
+        "stale-reduced-route-claim",
+        "api_server",
+    )
+    correlation_id = "8" * 32
+    user_message = "raw untrusted text"
+    persist_user_message = "safe durable prompt"
+    payload_hash = _reduced_authority_payload_hash(
+        user_message=user_message,
+        persist_user_message=persist_user_message,
+        reduced_authority=True,
+        ephemeral_system_prompt=None,
+        route=None,
+        request_route=None,
+        reasoning_effort_override=None,
+        service_tier_override=None,
+    )
+    assert session_db.claim_reduced_authority_turn(
+        session_id,
+        correlation_id=correlation_id,
+        payload_hash=payload_hash,
+    ) == "claimed"
+    session_db._execute_write(
+        lambda conn: conn.execute(
+            """
+            UPDATE reduced_authority_turn_claims
+            SET claimed_at = 0
+            WHERE session_id = ? AND correlation_id = ?
+            """,
+            (session_id, correlation_id),
+        )
+    )
+
+    class SlowCountingAgent:
+        session_prompt_tokens = 1
+        session_completion_tokens = 1
+        session_total_tokens = 2
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def run_conversation(self, **_kwargs):
+            with type(self).calls_lock:
+                type(self).calls += 1
+                call_number = type(self).calls
+            time.sleep(0.1)
+            return {"final_response": f"response-{call_number}"}
+
+    async def run_retry():
+        return await adapter._run_agent(
+            user_message=user_message,
+            conversation_history=[],
+            session_id=session_id,
+            persist_user_message=persist_user_message,
+            reduced_authority=True,
+            turn_correlation_id=correlation_id,
+        )
+
+    with patch.object(
+        adapter,
+        "_create_agent",
+        side_effect=lambda **_kwargs: SlowCountingAgent(),
+    ) as create_agent:
+        first, second = await asyncio.gather(run_retry(), run_retry())
+
+    assert create_agent.call_count == 1
+    assert SlowCountingAgent.calls == 1
+    assert first[0]["final_response"] == second[0]["final_response"] == (
+        "response-1"
+    )
     assert {first[1]["total_tokens"], second[1]["total_tokens"]} == {0, 2}
 
 

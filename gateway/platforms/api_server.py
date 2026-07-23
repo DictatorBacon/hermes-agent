@@ -439,6 +439,8 @@ _REDUCED_AUTHORITY_MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _REDUCED_AUTHORITY_MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
 # v1 covers bounded file-only context and mixed inline-image + file turns.
 _REDUCED_AUTHORITY_ATTACHMENTS_VERSION = 1
+_REDUCED_AUTHORITY_PENDING_WAIT_SECONDS = 0.5
+_REDUCED_AUTHORITY_RETRY_AFTER_SECONDS = 1.0
 _REDUCED_AUTHORITY_IMAGE_DATA_URL_RE = re.compile(
     r"data:(image/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})\Z",
     re.IGNORECASE,
@@ -3716,23 +3718,43 @@ class APIServerAdapter(BasePlatformAdapter):
                     turn_correlation_id=turn_correlation_id,
                 )
             except Exception as exc:
-                from hermes_state import ReducedAuthorityTurnConflictError
+                from hermes_state import (
+                    ReducedAuthorityTurnConflictError,
+                    ReducedAuthorityTurnInFlightError,
+                )
 
-                if not isinstance(exc, ReducedAuthorityTurnConflictError):
-                    raise
                 headers = {"X-Hermes-Session-Id": session_id}
                 if gateway_session_key:
                     headers["X-Hermes-Session-Key"] = gateway_session_key
-                return web.json_response(
-                    _openai_error(
-                        "turn_correlation_id was reused with a different "
-                        "request payload.",
-                        code="turn_correlation_conflict",
+                if isinstance(exc, ReducedAuthorityTurnConflictError):
+                    return web.json_response(
+                        _openai_error(
+                            "turn_correlation_id was reused with a different "
+                            "request payload.",
+                            code="turn_correlation_conflict",
+                            param="turn_correlation_id",
+                        ),
+                        status=409,
+                        headers=headers,
+                    )
+                if isinstance(exc, ReducedAuthorityTurnInFlightError):
+                    headers["Retry-After"] = str(
+                        max(1, int(exc.retry_after_seconds + 0.999))
+                    )
+                    payload = _openai_error(
+                        "An identical attachment turn is still in flight. "
+                        "Retry after the indicated delay.",
+                        err_type="server_error",
+                        code=exc.code,
                         param="turn_correlation_id",
-                    ),
-                    status=409,
-                    headers=headers,
-                )
+                    )
+                    payload["error"]["retryable"] = True
+                    return web.json_response(
+                        payload,
+                        status=503,
+                        headers=headers,
+                    )
+                raise
         if (
             reduced_authority
             and isinstance(result, dict)
@@ -3754,7 +3776,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 headers=headers,
             )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = (
+            result.get("final_response", "") if isinstance(result, dict) else ""
+        )
+        if not reduced_authority:
+            final_response = _resolve_media_to_data_urls(final_response)
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -3921,7 +3947,13 @@ class APIServerAdapter(BasePlatformAdapter):
                             )
                         }))
                         return
-                    final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                    final_response = (
+                        result.get("final_response", "")
+                        if isinstance(result, dict)
+                        else ""
+                    )
+                    if not reduced_authority:
+                        final_response = _resolve_media_to_data_urls(final_response)
                     effective_session_id = result.get("session_id", turn_session_id) if isinstance(result, dict) else turn_session_id
                     turn_messages = self._turn_transcript_messages(
                         history, visible_user_message, result
@@ -3947,8 +3979,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         "usage": usage,
                     }))
             except Exception as exc:
-                logger.exception("[api_server] session chat stream failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                from hermes_state import ReducedAuthorityTurnConflictError
+
+                if isinstance(exc, ReducedAuthorityTurnConflictError):
+                    await queue.put(_event_payload("error", {
+                        "message": (
+                            "turn_correlation_id was reused with a different "
+                            "request payload."
+                        ),
+                        "code": "turn_correlation_conflict",
+                        "param": "turn_correlation_id",
+                        "retryable": False,
+                    }))
+                else:
+                    logger.exception("[api_server] session chat stream failed")
+                    await queue.put(_event_payload(
+                        "error",
+                        {"message": _redact_api_error_text(exc)},
+                    ))
             finally:
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
@@ -6082,6 +6130,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 claim_db = None
                 payload_hash = None
                 claim_owned = False
+                claim_lease = None
                 try:
                     if reduced_authority:
                         if (
@@ -6103,11 +6152,19 @@ class APIServerAdapter(BasePlatformAdapter):
                             service_tier_override=service_tier_override,
                         )
                         claim_db = self._ensure_session_db()
+                        claim_wait_deadline = (
+                            time.monotonic()
+                            + _REDUCED_AUTHORITY_PENDING_WAIT_SECONDS
+                        )
                         while True:
-                            claim_state = claim_db.claim_reduced_authority_turn(
+                            (
+                                claim_state,
+                                claim_lease,
+                            ) = claim_db.claim_reduced_authority_turn(
                                 session_id,
                                 correlation_id=turn_correlation_id,
                                 payload_hash=payload_hash,
+                                with_lease=True,
                             )
                             if claim_state == "claimed":
                                 claim_owned = True
@@ -6146,7 +6203,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "output_tokens": 0,
                                     "total_tokens": 0,
                                 }
-                            time.sleep(0.01)
+                            wait_remaining = (
+                                claim_wait_deadline - time.monotonic()
+                            )
+                            if wait_remaining <= 0:
+                                from hermes_state import (
+                                    ReducedAuthorityTurnInFlightError,
+                                )
+
+                                raise ReducedAuthorityTurnInFlightError(
+                                    retry_after_seconds=(
+                                        _REDUCED_AUTHORITY_RETRY_AFTER_SECONDS
+                                    )
+                                )
+                            time.sleep(min(0.01, wait_remaining))
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=None if reduced_authority else session_id,
@@ -6188,6 +6258,42 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
+                    canonical_input_tokens = getattr(
+                        agent, "session_input_tokens", None
+                    )
+                    canonical_output_tokens = getattr(
+                        agent, "session_output_tokens", None
+                    )
+                    persisted_usage = {
+                        "input_tokens": (
+                            usage["input_tokens"]
+                            if canonical_input_tokens is None
+                            else canonical_input_tokens
+                        ),
+                        "output_tokens": (
+                            usage["output_tokens"]
+                            if canonical_output_tokens is None
+                            else canonical_output_tokens
+                        ),
+                        "cache_read_tokens": getattr(
+                            agent, "session_cache_read_tokens", 0
+                        ) or 0,
+                        "cache_write_tokens": getattr(
+                            agent, "session_cache_write_tokens", 0
+                        ) or 0,
+                        "reasoning_tokens": getattr(
+                            agent, "session_reasoning_tokens", 0
+                        ) or 0,
+                        "estimated_cost_usd": getattr(
+                            agent, "session_estimated_cost_usd", 0.0
+                        ) or 0.0,
+                        "cost_status": getattr(
+                            agent, "session_cost_status", None
+                        ),
+                        "cost_source": getattr(
+                            agent, "session_cost_source", None
+                        ),
+                    }
                     if reduced_authority:
                         if not session_id or not isinstance(persist_user_message, str):
                             raise RuntimeError(
@@ -6209,6 +6315,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id,
                                 correlation_id=turn_correlation_id,
                                 payload_hash=payload_hash,
+                                claim_lease=claim_lease,
                             )
                             claim_owned = False
                             return raw_result, usage
@@ -6223,6 +6330,18 @@ class APIServerAdapter(BasePlatformAdapter):
                             user_content=persist_user_message,
                             assistant_content=assistant_content,
                             finish_reason=raw_result.get("finish_reason"),
+                            claim_lease=claim_lease,
+                            usage=persisted_usage,
+                            api_call_count=(
+                                getattr(agent, "session_api_calls", None)
+                                if getattr(agent, "session_api_calls", None)
+                                is not None
+                                else raw_result.get("api_calls", 0)
+                            ),
+                            model=getattr(agent, "model", None),
+                            billing_provider=getattr(agent, "provider", None),
+                            billing_base_url=getattr(agent, "base_url", None),
+                            billing_mode=getattr(agent, "api_mode", None),
                         )
                         claim_owned = False
                         return {
@@ -6257,6 +6376,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         and claim_db is not None
                         and isinstance(payload_hash, str)
                         and isinstance(turn_correlation_id, str)
+                        and claim_lease is not None
                         and session_id
                     ):
                         try:
@@ -6264,6 +6384,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id,
                                 correlation_id=turn_correlation_id,
                                 payload_hash=payload_hash,
+                                claim_lease=claim_lease,
                             )
                         except Exception:
                             logger.exception(
