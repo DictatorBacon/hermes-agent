@@ -4223,8 +4223,9 @@ class AIAgent:
         # keep response state on the primary instance and omit the SDK close
         # lifecycle entirely. Reuse them just as we reuse Mock clients; real
         # OpenAI SDK clients expose close() and still get isolated per request.
-        if isinstance(primary_client, Mock) or not callable(
-            getattr(primary_client, "close", None)
+        if isinstance(primary_client, Mock) or (
+            not callable(getattr(primary_client, "close", None))
+            and getattr(primary_client, "chat", None) is not None
         ):
             return primary_client
         with self._openai_client_lock():
