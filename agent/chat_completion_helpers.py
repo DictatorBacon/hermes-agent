@@ -1991,9 +1991,18 @@ def handle_max_iterations(
             summary_extra_body["tags"] = _portal_tags()
 
         def _dispatch_toolless(api_kwargs):
-            """Use the ordinary interrupt worker and account every attempt."""
+            """Use the established summary transports and account every attempt."""
             try:
-                response = agent._interruptible_api_call(api_kwargs)
+                if agent.api_mode == "codex_responses":
+                    response = agent._run_codex_stream(api_kwargs)
+                elif agent.api_mode == "anthropic_messages":
+                    response = agent._anthropic_messages_create(api_kwargs)
+                elif agent.api_mode == "bedrock_converse":
+                    response = agent._interruptible_api_call(api_kwargs)
+                else:
+                    response = agent._ensure_primary_openai_client(
+                        reason="toolless_completion"
+                    ).chat.completions.create(**api_kwargs)
             except Exception:
                 _record_toolless_completion_usage(agent, None)
                 raise
