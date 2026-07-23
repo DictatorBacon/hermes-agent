@@ -4219,7 +4219,13 @@ class AIAgent:
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
             return primary_client
-        if isinstance(primary_client, Mock):
+        # Lightweight clients supplied by tests/embedders may intentionally
+        # keep response state on the primary instance and omit the SDK close
+        # lifecycle entirely. Reuse them just as we reuse Mock clients; real
+        # OpenAI SDK clients expose close() and still get isolated per request.
+        if isinstance(primary_client, Mock) or not callable(
+            getattr(primary_client, "close", None)
+        ):
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)

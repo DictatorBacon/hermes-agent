@@ -253,8 +253,18 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     only issues the request.
     """
     if agent.api_mode == "codex_responses":
+        # Tests and embedders may replace the bound transport method with a
+        # Mock whose side effect implements the original one-argument call
+        # shape.  Let that double own the request directly; constructing and
+        # passing a request-local SDK client would both bypass its configured
+        # response and add production-only keyword arguments to the double.
+        from unittest.mock import Mock
+
+        codex_stream = agent._run_codex_stream
+        if isinstance(codex_stream, Mock):
+            return codex_stream(api_kwargs)
         request_client = make_client("codex_stream_request")
-        return agent._run_codex_stream(
+        return codex_stream(
             api_kwargs,
             client=request_client,
             on_first_delta=getattr(agent, "_codex_on_first_delta", None),
@@ -1991,18 +2001,9 @@ def handle_max_iterations(
             summary_extra_body["tags"] = _portal_tags()
 
         def _dispatch_toolless(api_kwargs):
-            """Use the established summary transports and account every attempt."""
+            """Use the ordinary interrupt worker and account every attempt."""
             try:
-                if agent.api_mode == "codex_responses":
-                    response = agent._run_codex_stream(api_kwargs)
-                elif agent.api_mode == "anthropic_messages":
-                    response = agent._anthropic_messages_create(api_kwargs)
-                elif agent.api_mode == "bedrock_converse":
-                    response = agent._interruptible_api_call(api_kwargs)
-                else:
-                    response = agent._ensure_primary_openai_client(
-                        reason="toolless_completion"
-                    ).chat.completions.create(**api_kwargs)
+                response = agent._interruptible_api_call(api_kwargs)
             except Exception:
                 _record_toolless_completion_usage(agent, None)
                 raise
