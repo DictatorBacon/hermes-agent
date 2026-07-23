@@ -437,6 +437,8 @@ _REDUCED_AUTHORITY_MAX_IMAGES = 4
 _REDUCED_AUTHORITY_MAX_MESSAGE_PARTS = 5
 _REDUCED_AUTHORITY_MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _REDUCED_AUTHORITY_MAX_TOTAL_IMAGE_BYTES = 8 * 1024 * 1024
+# v1 covers bounded file-only context and mixed inline-image + file turns.
+_REDUCED_AUTHORITY_ATTACHMENTS_VERSION = 1
 _REDUCED_AUTHORITY_IMAGE_DATA_URL_RE = re.compile(
     r"data:(image/(?:png|jpeg));base64,([A-Za-z0-9+/]*={0,2})\Z",
     re.IGNORECASE,
@@ -2631,6 +2633,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_streaming": True,
                 "session_fork": True,
                 "transcript_derivation_v1": True,
+                "reduced_authority_attachments_version": (
+                    _REDUCED_AUTHORITY_ATTACHMENTS_VERSION
+                ),
                 "session_search": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,

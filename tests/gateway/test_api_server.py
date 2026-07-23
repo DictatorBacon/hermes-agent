@@ -1006,6 +1006,23 @@ class TestCapabilitiesEndpoint:
             data = await authed.json()
             assert data["auth"]["required"] is True
 
+    @pytest.mark.asyncio
+    async def test_capabilities_advertises_reduced_authority_attachments_v1(
+        self,
+        auth_adapter,
+    ):
+        """Authenticated clients can detect bounded file and mixed-media turns."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/v1/capabilities",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["features"]["reduced_authority_attachments_version"] == 1
+
 
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints
