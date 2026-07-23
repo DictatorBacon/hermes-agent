@@ -377,6 +377,196 @@ class TestApiServerAdapterToolset:
                 )
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_reduced_direct_vision_route_bypasses_broken_default_runtime(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("broken default runtime must not be resolved"),
+        ) as default_resolver, patch(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            return_value={
+                "api_key": "route-key",
+                "base_url": "https://route.invalid/v1",
+                "provider": "openai-codex",
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": [],
+                "credential_pool": None,
+            },
+        ) as route_resolver, patch(
+            "gateway.run._resolve_gateway_model",
+            return_value="broken-default-model",
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "agent.image_routing._lookup_supports_vision",
+            return_value=True,
+        ) as vision_lookup, patch(
+            "run_agent.AIAgent",
+        ) as agent_cls:
+            agent_cls.return_value = MagicMock(tools=[], valid_tool_names=set())
+
+            adapter._create_agent(
+                reduced_authority=True,
+                requires_vision=True,
+                request_route={
+                    "model": "gpt-5.6-sol",
+                    "provider": "openai-codex",
+                    "api_key": "route-key",
+                    "base_url": "https://route.invalid/v1",
+                },
+            )
+
+        default_resolver.assert_not_called()
+        route_resolver.assert_called_once_with(
+            "openai-codex",
+            api_key="route-key",
+            base_url="https://route.invalid/v1",
+            target_model="gpt-5.6-sol",
+        )
+        vision_lookup.assert_called_once_with("openai-codex", "gpt-5.6-sol", {})
+        assert agent_cls.call_args.kwargs["model"] == "gpt-5.6-sol"
+        assert agent_cls.call_args.kwargs["api_key"] == "route-key"
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_reduced_nonvision_route_rejects_before_agent_or_auxiliary_calls(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("broken default runtime must not be resolved"),
+        ) as default_resolver, patch(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            return_value={
+                "api_key": "route-key",
+                "base_url": "https://route.invalid/v1",
+                "provider": "openai-codex",
+                "api_mode": "chat_completions",
+                "command": None,
+                "args": [],
+                "credential_pool": None,
+            },
+        ), patch(
+            "gateway.run._resolve_gateway_model",
+            return_value="broken-default-model",
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "agent.image_routing._lookup_supports_vision",
+            return_value=False,
+        ), patch(
+            "tools.vision_tools.vision_analyze_tool",
+            side_effect=AssertionError("auxiliary vision must not run"),
+        ) as auxiliary_vision, patch(
+            "run_agent.AIAgent",
+        ) as agent_cls:
+            with pytest.raises(ValueError, match="vision-capable"):
+                adapter._create_agent(
+                    reduced_authority=True,
+                    requires_vision=True,
+                    request_route={
+                        "model": "text-only-model",
+                        "provider": "openai-codex",
+                        "api_key": "route-key",
+                        "base_url": "https://route.invalid/v1",
+                    },
+                )
+
+        default_resolver.assert_not_called()
+        agent_cls.assert_not_called()
+        auxiliary_vision.assert_not_called()
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_invalid_reduced_explicit_route_never_falls_back_to_default_runtime(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("default runtime must not mask route failure"),
+        ) as default_resolver, patch(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            side_effect=RuntimeError("explicit route unavailable"),
+        ) as route_resolver, patch(
+            "gateway.run._resolve_gateway_model",
+            return_value="broken-default-model",
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "run_agent.AIAgent",
+        ) as agent_cls:
+            with pytest.raises(RuntimeError, match="explicit route unavailable"):
+                adapter._create_agent(
+                    reduced_authority=True,
+                    request_route={
+                        "model": "invalid-route-model",
+                        "provider": "invalid-route-provider",
+                    },
+                )
+
+        default_resolver.assert_not_called()
+        route_resolver.assert_called_once_with(
+            "invalid-route-provider",
+            api_key=None,
+            base_url=None,
+            target_model="invalid-route-model",
+        )
+        agent_cls.assert_not_called()
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_reduced_explicit_route_still_rejects_subprocess_runtime(self):
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            side_effect=AssertionError("default runtime must not be resolved"),
+        ) as default_resolver, patch(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            return_value={
+                "api_key": None,
+                "base_url": None,
+                "provider": "codex_app_server",
+                "api_mode": "codex_app_server",
+                "command": "codex",
+                "args": ["app-server"],
+                "credential_pool": None,
+            },
+        ), patch(
+            "gateway.run._resolve_gateway_model",
+            return_value="broken-default-model",
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "run_agent.AIAgent",
+        ) as agent_cls:
+            with pytest.raises(
+                ValueError,
+                match="not allowed for reduced-authority",
+            ):
+                adapter._create_agent(
+                    reduced_authority=True,
+                    request_route={
+                        "model": "gpt-codex",
+                        "provider": "codex_app_server",
+                    },
+                )
+
+        default_resolver.assert_not_called()
+        agent_cls.assert_not_called()
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reduced_authority_enforces_empty_final_tool_surface(
         self, monkeypatch
     ):

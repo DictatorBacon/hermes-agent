@@ -2504,6 +2504,7 @@ async def test_reduced_authority_route_accepts_two_validated_input_images(
         "Compare these images.\n\n"
         "[2 input images omitted from durable history]"
     )
+    assert captured["requires_vision"] is True
     assert _VALID_PNG_DATA_URL not in body
     assert _VALID_JPEG_DATA_URL not in body
 
@@ -3487,6 +3488,7 @@ async def test_fresh_reduced_authority_claim_is_bounded_retryable_503(
     assert response.headers["Retry-After"] == "1"
     assert payload["error"]["code"] == "turn_in_flight"
     assert payload["error"]["retryable"] is True
+    assert payload["error"]["retry_after_seconds"] == 1
 
 
 @pytest.mark.asyncio
@@ -3728,6 +3730,74 @@ async def test_reduced_authority_stream_conflict_has_deterministic_error_code(
     assert "second private payload" not in conflict_body
     assert create_agent.call_count == 1
     assert CountingAgent.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reduced_authority_stream_in_flight_error_is_bounded_and_retryable(
+    adapter,
+    session_db,
+):
+    from hermes_state import ReducedAuthorityTurnInFlightError
+
+    session_id = session_db.create_session(
+        "reduced-stream-in-flight",
+        "api_server",
+    )
+    app = _create_session_app(adapter)
+    with patch.object(
+        adapter,
+        "_run_agent",
+        new=AsyncMock(
+            side_effect=ReducedAuthorityTurnInFlightError(
+                retry_after_seconds=1.2,
+            )
+        ),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            response = await asyncio.wait_for(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={
+                        "message": "Summarize.",
+                        "untrusted_context": [{
+                            "name": "notes.txt",
+                            "media_type": "text/plain",
+                            "content": "private payload",
+                        }],
+                        "turn_correlation_id": "8" * 32,
+                    },
+                ),
+                timeout=2.0,
+            )
+            response_body = await asyncio.wait_for(response.text(), timeout=2.0)
+
+    error_payloads = []
+    for event in response_body.split("\n\n"):
+        lines = event.splitlines()
+        if "event: error" not in lines:
+            continue
+        data_line = next(
+            line for line in lines if line.startswith("data: ")
+        )
+        error_payloads.append(json.loads(data_line.removeprefix("data: ")))
+
+    assert response.status == 200
+    assert len(error_payloads) == 1
+    assert error_payloads[0] == {
+        "message": (
+            "An identical attachment turn is still in flight. "
+            "Retry after the indicated delay."
+        ),
+        "type": "server_error",
+        "code": "turn_in_flight",
+        "param": "turn_correlation_id",
+        "retryable": True,
+        "retry_after_seconds": 2,
+        "session_id": session_id,
+        "run_id": error_payloads[0]["run_id"],
+        "seq": error_payloads[0]["seq"],
+        "ts": error_payloads[0]["ts"],
+    }
 
 
 @pytest.mark.asyncio

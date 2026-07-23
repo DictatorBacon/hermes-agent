@@ -399,6 +399,15 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _content_has_image_payload(content: Any) -> bool:
+    """Return True when normalized content contains a direct image part."""
+    return isinstance(content, list) and any(
+        isinstance(part, dict)
+        and str(part.get("type") or "").strip().lower() in _IMAGE_PART_TYPES
+        for part in content
+    )
+
+
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -1228,6 +1237,26 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _reduced_authority_in_flight_error(
+    exc: BaseException,
+) -> tuple[Dict[str, Any], int]:
+    """Build the bounded retry contract shared by sync and SSE responses."""
+    retry_after_seconds = max(
+        1,
+        int(float(getattr(exc, "retry_after_seconds", 0.0)) + 0.999),
+    )
+    payload = _openai_error(
+        "An identical attachment turn is still in flight. "
+        "Retry after the indicated delay.",
+        err_type="server_error",
+        code="turn_in_flight",
+        param="turn_correlation_id",
+    )
+    payload["error"]["retryable"] = True
+    payload["error"]["retry_after_seconds"] = retry_after_seconds
+    return payload, retry_after_seconds
 
 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
@@ -2293,6 +2322,7 @@ class APIServerAdapter(BasePlatformAdapter):
         reasoning_effort_override: Optional[str] = None,
         service_tier_override: Optional[str] = None,
         reduced_authority: bool = False,
+        requires_vision: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2323,11 +2353,6 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = (
-            _resolve_runtime_agent_kwargs(allow_fallback=False)
-            if reduced_authority
-            else _resolve_runtime_agent_kwargs()
-        )
         reasoning_config = GatewayRunner._load_reasoning_config()
         service_tier = GatewayRunner._load_service_tier()
         if reasoning_effort_override is not None:
@@ -2337,6 +2362,36 @@ class APIServerAdapter(BasePlatformAdapter):
         if service_tier_override is not None:
             service_tier = "priority" if service_tier_override == "priority" else None
         model = _resolve_gateway_model()
+
+        # Static aliases defer to a session /model override. Authenticated
+        # per-turn selections are authoritative over both.
+        if request_route is not None:
+            effective_route = request_route
+        else:
+            session_override = self._session_model_override_for(
+                gateway_session_key or session_id
+            )
+            effective_route = session_override or route
+
+        # An authenticated reduced-authority route with an explicit provider
+        # owns its complete runtime selection. Resolve it directly so an
+        # expired or otherwise broken default provider cannot block the turn.
+        # Provider resolution failures remain terminal and never fall back.
+        explicit_reduced_provider_route = bool(
+            reduced_authority
+            and request_route is not None
+            and effective_route
+            and effective_route.get("provider")
+        )
+        runtime_kwargs = (
+            {}
+            if explicit_reduced_provider_route
+            else (
+                _resolve_runtime_agent_kwargs(allow_fallback=False)
+                if reduced_authority
+                else _resolve_runtime_agent_kwargs()
+            )
+        )
 
         # When the primary provider's auth fails (expired token / 429 quota
         # cap), _resolve_runtime_agent_kwargs() falls through to the fallback
@@ -2350,17 +2405,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if runtime_model:
             model = runtime_model
 
-        # Static aliases defer to a session /model override. Authenticated
-        # per-turn selections are authoritative over both.
-        session_override = self._session_model_override_for(
-            gateway_session_key or session_id
-        )
-        if request_route is not None:
-            effective_route = request_route
-        elif session_override:
-            effective_route = session_override
-        else:
-            effective_route = route
         if effective_route:
             if effective_route.get("model"):
                 model = effective_route["model"]
@@ -2430,6 +2474,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 f"Provider runtime {provider_name or 'subprocess'} is not allowed "
                 "for reduced-authority turns"
             )
+
+        if reduced_authority and requires_vision:
+            from agent.image_routing import _lookup_supports_vision
+
+            if _lookup_supports_vision(provider_name, model, user_config) is not True:
+                raise ValueError(
+                    "Reduced-authority image turns require a vision-capable "
+                    "direct model route"
+                )
 
         max_iterations = 1 if reduced_authority else _current_max_iterations()
 
@@ -3694,6 +3747,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     service_tier_override=service_tier_override,
                     persist_user_message=persist_user_message,
                     reduced_authority=reduced_authority,
+                    requires_vision=(
+                        reduced_authority
+                        and _content_has_image_payload(user_message)
+                    ),
                     turn_correlation_id=turn_correlation_id,
                 )
             except Exception as exc:
@@ -3717,17 +3774,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         headers=headers,
                     )
                 if isinstance(exc, ReducedAuthorityTurnInFlightError):
-                    headers["Retry-After"] = str(
-                        max(1, int(exc.retry_after_seconds + 0.999))
+                    payload, retry_after_seconds = (
+                        _reduced_authority_in_flight_error(exc)
                     )
-                    payload = _openai_error(
-                        "An identical attachment turn is still in flight. "
-                        "Retry after the indicated delay.",
-                        err_type="server_error",
-                        code=exc.code,
-                        param="turn_correlation_id",
-                    )
-                    payload["error"]["retryable"] = True
+                    headers["Retry-After"] = str(retry_after_seconds)
                     return web.json_response(
                         payload,
                         status=503,
@@ -3913,6 +3963,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         service_tier_override=service_tier_override,
                         persist_user_message=persist_user_message,
                         reduced_authority=reduced_authority,
+                        requires_vision=(
+                            reduced_authority
+                            and _content_has_image_payload(user_message)
+                        ),
                         turn_correlation_id=turn_correlation_id,
                     )
                     if isinstance(result, dict) and (
@@ -3958,7 +4012,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "usage": usage,
                     }))
             except Exception as exc:
-                from hermes_state import ReducedAuthorityTurnConflictError
+                from hermes_state import (
+                    ReducedAuthorityTurnConflictError,
+                    ReducedAuthorityTurnInFlightError,
+                )
 
                 if isinstance(exc, ReducedAuthorityTurnConflictError):
                     await queue.put(_event_payload("error", {
@@ -3970,6 +4027,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "param": "turn_correlation_id",
                         "retryable": False,
                     }))
+                elif isinstance(exc, ReducedAuthorityTurnInFlightError):
+                    payload, _retry_after_seconds = (
+                        _reduced_authority_in_flight_error(exc)
+                    )
+                    await queue.put(_event_payload("error", payload["error"]))
                 else:
                     logger.exception("[api_server] session chat stream failed")
                     await queue.put(_event_payload(
@@ -6074,6 +6136,7 @@ class APIServerAdapter(BasePlatformAdapter):
         service_tier_override: Optional[str] = None,
         persist_user_message: Optional[Any] = None,
         reduced_authority: bool = False,
+        requires_vision: bool = False,
         turn_correlation_id: Optional[str] = None,
     ) -> tuple:
         """
@@ -6212,6 +6275,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         reasoning_effort_override=reasoning_effort_override,
                         service_tier_override=service_tier_override,
                         reduced_authority=reduced_authority,
+                        requires_vision=(
+                            requires_vision
+                            or (
+                                reduced_authority
+                                and _content_has_image_payload(user_message)
+                            )
+                        ),
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
