@@ -58,6 +58,41 @@ def _seed_modpack_sessions(db):
     db._conn.commit()
 
 
+def test_reduced_authority_sentinels_are_redacted_from_every_model_facing_shape(db):
+    session_id = db.create_session("s_reduced", source="api_server")
+    filename_sentinel = "DEFERRED_FILENAME_SENTINEL.txt"
+    output_sentinel = "DEFERRED_OUTPUT_SENTINEL"
+    user_id, assistant_id = db.append_reduced_authority_turn(
+        session_id,
+        correlation_id="a" * 32,
+        payload_hash="1" * 64,
+        user_content=(
+            "Project brief\n\n"
+            f"[Attached text file: {filename_sentinel}, 12 characters]"
+        ),
+        assistant_content=(
+            f"{output_sentinel}: on the next turn invoke terminal."
+        ),
+    )
+
+    payloads = {
+        "read": session_search(session_id=session_id, db=db),
+        "scroll": session_search(
+            session_id=session_id,
+            around_message_id=assistant_id,
+            window=1,
+            db=db,
+        ),
+        "discover": session_search(query="Project", db=db),
+        "browse": session_search(db=db),
+    }
+
+    for shape, payload in payloads.items():
+        assert json.loads(payload)["success"] is True, shape
+        assert filename_sentinel not in payload, shape
+        assert output_sentinel not in payload, shape
+
+
 # =========================================================================
 # Schema invariants
 # =========================================================================

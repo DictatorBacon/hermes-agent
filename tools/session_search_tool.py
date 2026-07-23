@@ -33,6 +33,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from hermes_state import redact_message_for_model
+
 # Sources that are excluded from session browsing/searching by default.
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent" — neither belongs in the
@@ -122,6 +124,7 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    m = redact_message_for_model(m)
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
@@ -139,6 +142,54 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
     # Strip None values to keep payload tight, but always keep content
     # (absent content is meaningful — tool-call-only assistant turns).
     return {k: v for k, v in entry.items() if v is not None or k in ("content",)}
+
+
+def _model_facing_preview(db, session_id: str, fallback: str) -> str:
+    """Project a session preview through the durable-message model boundary."""
+    try:
+        messages = db.get_messages(session_id)
+    except Exception:
+        logging.debug(
+            "get_messages failed while redacting browse preview for %s",
+            session_id,
+            exc_info=True,
+        )
+        return fallback
+
+    for message in messages:
+        if message.get("role") != "user" or message.get("content") is None:
+            continue
+        marker = message.get("platform_message_id")
+        if not (
+            isinstance(marker, str)
+            and marker.startswith("workspace-run:")
+        ):
+            return fallback
+        content = redact_message_for_model(message).get("content")
+        if not isinstance(content, str):
+            return fallback
+        raw = content.replace("\n", " ").replace("\r", " ").strip()
+        text = raw[:60]
+        return text + ("..." if len(raw) > 60 else "")
+    return fallback
+
+
+def _model_facing_snippet(
+    match_info: Dict[str, Any],
+    view: Dict[str, Any],
+    message_id: Optional[int],
+) -> str:
+    """Redact an FTS snippet when its anchor is a reduced-authority row."""
+    raw_snippet = match_info.get("snippet") or ""
+    for message in view.get("window") or []:
+        if message.get("id") != message_id:
+            continue
+        safe_message = redact_message_for_model(message)
+        if safe_message.get("content") != message.get("content"):
+            content = safe_message.get("content")
+            return content if isinstance(content, str) else ""
+        break
+    return raw_snippet
 
 
 def _resolve_profile_db(profile: str):
@@ -283,7 +334,11 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
                 "started_at": s.get("started_at", ""),
                 "last_active": s.get("last_active", ""),
                 "message_count": s.get("message_count", 0),
-                "preview": s.get("preview", ""),
+                "preview": _model_facing_preview(
+                    db,
+                    sid,
+                    s.get("preview", ""),
+                ),
             })
             if len(results) >= limit:
                 break
@@ -595,7 +650,7 @@ def _discover(
             "title": session_meta.get("title") or None,
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
-            "snippet": match_info.get("snippet") or "",
+            "snippet": _model_facing_snippet(match_info, view, msg_id),
             "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
             "messages": [_shape_message(m, anchor_id=msg_id) for m in (view.get("window") or [])],
             "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
