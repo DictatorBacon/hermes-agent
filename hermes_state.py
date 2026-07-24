@@ -4541,7 +4541,7 @@ class SessionDB:
                     ) AS last_active
                 FROM sessions s
                 {where_sql}
-                ORDER BY s.started_at DESC
+                ORDER BY s.started_at DESC, s.id DESC
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
@@ -6830,6 +6830,22 @@ class SessionDB:
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
+        # When the caller supplies an allow-list, force SQLite to walk the
+        # indexed session rows before probing FTS. Starting from the virtual
+        # table makes FTS rank every global match, then discard nearly all of
+        # them at the session filter. That becomes unusable on multi-gigabyte
+        # stores even for a handful of allowed sessions.
+        if session_filter_json is not None:
+            fts_from_sql = (
+                "messages m CROSS JOIN messages_fts "
+                "ON messages_fts.rowid = m.id"
+            )
+        else:
+            fts_from_sql = (
+                "messages_fts JOIN messages m "
+                "ON m.id = messages_fts.rowid"
+            )
+
         if distinct_sessions:
             if sort_norm == "newest":
                 representative_order = "timestamp DESC, search_rank, id DESC"
@@ -6847,8 +6863,7 @@ class SessionDB:
                         m.timestamp, m.tool_name, s.source, s.model,
                         s.title AS session_title, s.started_at AS session_started,
                         bm25(messages_fts) AS search_rank
-                    FROM messages_fts
-                    JOIN messages m ON m.id = messages_fts.rowid
+                    FROM {fts_from_sql}
                     JOIN sessions s ON s.id = m.session_id
                     WHERE {where_sql}
                 ), ranked AS (
@@ -6877,8 +6892,7 @@ class SessionDB:
                     s.source,
                     s.model,
                     s.started_at AS session_started
-                FROM messages_fts
-                JOIN messages m ON m.id = messages_fts.rowid
+                FROM {fts_from_sql}
                 JOIN sessions s ON s.id = m.session_id
                 WHERE {where_sql}
                 {order_by_sql}
@@ -6943,6 +6957,16 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                if session_filter_json is not None:
+                    tri_from_sql = (
+                        "messages m CROSS JOIN messages_fts_trigram "
+                        "ON messages_fts_trigram.rowid = m.id"
+                    )
+                else:
+                    tri_from_sql = (
+                        "messages_fts_trigram JOIN messages m "
+                        "ON m.id = messages_fts_trigram.rowid"
+                    )
                 if distinct_sessions:
                     tri_sql = f"""
                         WITH hits AS (
@@ -6951,8 +6975,7 @@ class SessionDB:
                                 m.timestamp, m.tool_name, s.source, s.model,
                                 s.title AS session_title, s.started_at AS session_started,
                                 bm25(messages_fts_trigram) AS search_rank
-                            FROM messages_fts_trigram
-                            JOIN messages m ON m.id = messages_fts_trigram.rowid
+                            FROM {tri_from_sql}
                             JOIN sessions s ON s.id = m.session_id
                             WHERE {' AND '.join(tri_where)}
                         ), ranked AS (
@@ -6981,8 +7004,7 @@ class SessionDB:
                             s.source,
                             s.model,
                             s.started_at AS session_started
-                        FROM messages_fts_trigram
-                        JOIN messages m ON m.id = messages_fts_trigram.rowid
+                        FROM {tri_from_sql}
                         JOIN sessions s ON s.id = m.session_id
                         WHERE {' AND '.join(tri_where)}
                         {order_by_sql}
